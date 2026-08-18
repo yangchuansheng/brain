@@ -1,12 +1,16 @@
+import { randomUUID } from "node:crypto";
+
 import { type SQL, sql } from "drizzle-orm";
 
 import {
   deploymentFailureMessage,
   isDeployTaskFailureReason,
 } from "../failure-summary";
-import type {
-  DeployTaskFailureDetails,
-  DeployTaskFailureReason,
+import { MANAGED_INPUT_CLEANUP_PENDING_RUNTIME_STATE } from "../managed-deployment-contract";
+import {
+  CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+  type DeployTaskFailureDetails,
+  type DeployTaskFailureReason,
 } from "../schema";
 import type { DeployTaskEngineContext } from "./context";
 import {
@@ -28,14 +32,14 @@ import {
 
 export interface DeployTaskReaperSummary {
   cancelAckForced: number;
+  devboxDeleted: number;
+  devboxDeleteFailed: number;
   devboxPaused: number;
   devboxPauseFailed: number;
   interrupted: number;
   interruptedWithCancel: number;
   invalidBlocked: number;
   neverStarted: number;
-  purged: number;
-  purgeFailed: number;
   timedOut: number;
 }
 
@@ -112,12 +116,33 @@ function invalidBlockedFailureReason(
   return LEGACY_EMPTY_BLOCKED_REASON_BY_EVENT_KIND[eventKind] ?? "unknown";
 }
 
+function invalidBlockedTaskWhere(): SQL {
+  return sql`
+    "status" = 'blocked'
+    AND (
+      jsonb_array_length(COALESCE("blocking_inputs", '[]'::jsonb)) = 0
+      OR (
+        COALESCE("runner" ->> 'kind', '') = 'ai'
+        AND COALESCE(
+          "artifact_summary" ->> 'publicProjectionVersion',
+          ''
+        ) <> ${String(CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION)}
+      )
+    )
+  `;
+}
+
 async function sweepInvalidBlockedTasks(
   ctx: DeployTaskEngineContext
 ): Promise<number> {
   const candidates = rowsOf(
     await ctx.db.execute(sql`
-      SELECT task."id", cause."kind" AS "event_kind", cause."payload" AS "event_payload"
+      SELECT
+        task."id",
+        jsonb_array_length(COALESCE(task."blocking_inputs", '[]'::jsonb))
+          AS "blocking_input_count",
+        cause."kind" AS "event_kind",
+        cause."payload" AS "event_payload"
       FROM ${TASKS} task
       LEFT JOIN LATERAL (
         SELECT event."kind", event."payload"
@@ -134,8 +159,7 @@ async function sweepInvalidBlockedTasks(
         ORDER BY event."seq" DESC
         LIMIT 1
       ) cause ON true
-      WHERE task."status" = 'blocked'
-        AND jsonb_array_length(COALESCE(task."blocking_inputs", '[]'::jsonb)) = 0
+      WHERE ${invalidBlockedTaskWhere()}
     `)
   );
 
@@ -147,24 +171,28 @@ async function sweepInvalidBlockedTasks(
     }
     const reason = invalidBlockedFailureReason(candidate);
     const message = deploymentFailureMessage(reason);
+    const detail =
+      Number(candidate.blocking_input_count) === 0
+        ? "empty-blocking-inputs"
+        : "untrusted-ai-blocking-inputs";
     const rows = await sweepVerdict(ctx, {
       error: message,
       event: {
         kind: "deployment_task.engine_resolved",
         message,
         payload: {
-          detail: "empty-blocking-inputs",
+          detail,
           reason,
           verdict: "failed",
         },
       },
       failureDetails: {
-        detail: "empty-blocking-inputs",
+        detail,
         failureMessage: message,
         reason,
       },
       to: "failed",
-      where: sql`"id" = ${taskId} AND "status" = 'blocked' AND jsonb_array_length(COALESCE("blocking_inputs", '[]'::jsonb)) = 0`,
+      where: sql`"id" = ${taskId} AND ${invalidBlockedTaskWhere()}`,
     });
     repaired += rows.length;
   }
@@ -173,8 +201,8 @@ async function sweepInvalidBlockedTasks(
 
 interface DevboxTaskRecord {
   namespace: string;
-  projectId: string | null;
   runtimeName: string;
+  runtimeState: string;
   taskId: string;
 }
 
@@ -187,9 +215,8 @@ function devboxRecordsOf(result: unknown): DevboxTaskRecord[] {
     return [
       {
         namespace: String(record.namespace ?? ""),
-        projectId:
-          record.project_uid == null ? null : String(record.project_uid),
         runtimeName,
+        runtimeState: String(record.runtime_state ?? "").toLowerCase(),
         taskId: String(record.id),
       },
     ];
@@ -199,116 +226,218 @@ function devboxRecordsOf(result: unknown): DevboxTaskRecord[] {
 async function markRuntimeState(
   ctx: DeployTaskEngineContext,
   taskId: string,
-  runtimeState: "deleted" | "paused"
+  runtimeState: "deleted" | "paused",
+  cleanupLeaseOwner: string
+): Promise<void> {
+  if (runtimeState === "paused") {
+    await ctx.db.execute(sql`
+      UPDATE ${TASKS}
+      SET "runtime_state" = 'paused',
+          "runtime_paused_at" = coalesce("runtime_paused_at", now()),
+          "runtime_cleanup_lease_owner" = NULL,
+          "runtime_cleanup_lease_expires_at" = NULL
+      WHERE "id" = ${taskId}
+        AND "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
+        AND "runtime_cleanup_lease_owner" = ${cleanupLeaseOwner}
+    `);
+    return;
+  }
+  await ctx.db.execute(sql`
+    UPDATE ${TASKS}
+    SET "runtime_state" = 'deleted',
+        "runtime_cleanup_lease_owner" = NULL,
+        "runtime_cleanup_lease_expires_at" = NULL
+    WHERE "id" = ${taskId}
+      AND "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
+      AND "runtime_cleanup_lease_owner" = ${cleanupLeaseOwner}
+  `);
+}
+
+async function releaseDevboxCleanupClaim(
+  ctx: DeployTaskEngineContext,
+  taskId: string,
+  cleanupLeaseOwner: string
 ): Promise<void> {
   await ctx.db.execute(sql`
     UPDATE ${TASKS}
-    SET "runtime_state" = ${runtimeState}, "updated_at" = now()
+    SET "runtime_cleanup_lease_owner" = NULL,
+        "runtime_cleanup_lease_expires_at" = now() + ${intervalFromMs(ctx.cadence.reaperIntervalMs)}
     WHERE "id" = ${taskId}
-      AND "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
+      AND "runtime_cleanup_lease_owner" = ${cleanupLeaseOwner}
   `);
+}
+
+async function processWithConcurrency<T>(
+  records: readonly T[],
+  concurrency: number,
+  operation: (record: T) => Promise<boolean>
+): Promise<{ failed: number; succeeded: number }> {
+  let failed = 0;
+  let succeeded = 0;
+  for (let index = 0; index < records.length; index += concurrency) {
+    const outcomes = await Promise.all(
+      records.slice(index, index + concurrency).map(operation)
+    );
+    succeeded += outcomes.filter(Boolean).length;
+    failed += outcomes.filter((outcome) => !outcome).length;
+  }
+  return { failed, succeeded };
 }
 
 /**
  * Pause devboxes left running by terminal tasks whose runner never got to
- * pause them (crash, forced resolution). Server-minted devbox JWT — the one
- * engine-side integration (ADR 0037/0038).
+ * pause them (crash, forced resolution). A runtime whose submitted-input
+ * cleanup is pending or failed is deleted instead so it can never be archived.
+ * Server-minted devbox JWT — the one engine-side integration (ADR 0037/0038).
  */
 async function sweepTerminalDevboxPauses(
   ctx: DeployTaskEngineContext
 ): Promise<{ failed: number; paused: number }> {
+  const cleanupLeaseOwner = `${ctx.processId}:${randomUUID()}`;
   const candidates = await ctx.db.execute(sql`
-    SELECT "id", "namespace", "project_uid", "runtime_name"
-    FROM ${TASKS}
-    WHERE "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
-      AND "runtime_provider" = 'devbox'
-      AND "runtime_name" IS NOT NULL
-      AND (lower(coalesce("runtime_state", '')) NOT IN ('paused', 'deleted', 'archived'))
-    ORDER BY "completed_at" ASC NULLS FIRST
-    LIMIT ${ctx.cadence.devboxPauseBatchSize}
+    WITH candidates AS (
+      SELECT "id"
+      FROM ${TASKS}
+      WHERE "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
+        AND "runtime_provider" = 'devbox'
+        AND "runtime_name" IS NOT NULL
+        AND (lower(coalesce("runtime_state", '')) NOT IN ('paused', 'deleted', 'archived'))
+        AND (
+          "runtime_cleanup_lease_expires_at" IS NULL
+          OR "runtime_cleanup_lease_expires_at" <= now()
+        )
+      ORDER BY "completed_at" ASC NULLS FIRST
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${ctx.cadence.devboxPauseBatchSize}
+    )
+    UPDATE ${TASKS} task
+    SET "runtime_cleanup_lease_owner" = ${cleanupLeaseOwner},
+        "runtime_cleanup_lease_expires_at" = now() + ${intervalFromMs(ctx.cadence.leaseDurationMs)}
+    FROM candidates
+    WHERE task."id" = candidates."id"
+    RETURNING task."id", task."namespace", task."runtime_name", task."runtime_state"
   `);
-  let paused = 0;
-  let failed = 0;
-  for (const record of devboxRecordsOf(candidates)) {
-    try {
-      const result = await ctx.devbox.pauseDevbox(
-        record.namespace,
-        record.runtimeName
-      );
-      await markRuntimeState(
-        ctx,
-        record.taskId,
-        result === "missing" ? "deleted" : "paused"
-      );
-      paused += 1;
-    } catch (error) {
-      failed += 1;
-      console.error(
-        `[deploy-task-reaper] devbox pause failed for task ${record.taskId}:`,
-        error
-      );
+  const result = await processWithConcurrency(
+    devboxRecordsOf(candidates),
+    ctx.cadence.devboxOperationConcurrency,
+    async (record) => {
+      try {
+        if (
+          record.runtimeState === "cleanup-failed" ||
+          record.runtimeState === MANAGED_INPUT_CLEANUP_PENDING_RUNTIME_STATE
+        ) {
+          await ctx.devbox.deleteDevbox(record.namespace, record.runtimeName);
+          await markRuntimeState(
+            ctx,
+            record.taskId,
+            "deleted",
+            cleanupLeaseOwner
+          );
+          return true;
+        }
+        const pauseResult = await ctx.devbox.pauseDevbox(
+          record.namespace,
+          record.runtimeName
+        );
+        await markRuntimeState(
+          ctx,
+          record.taskId,
+          pauseResult === "missing" ? "deleted" : "paused",
+          cleanupLeaseOwner
+        );
+        return true;
+      } catch (error) {
+        try {
+          await releaseDevboxCleanupClaim(
+            ctx,
+            record.taskId,
+            cleanupLeaseOwner
+          );
+        } catch (releaseError) {
+          console.error(
+            `[deploy-task-reaper] cleanup claim release failed for task ${record.taskId}:`,
+            releaseError
+          );
+        }
+        console.error(
+          `[deploy-task-reaper] devbox pause failed for task ${record.taskId}:`,
+          error
+        );
+        return false;
+      }
     }
-  }
-  return { failed, paused };
+  );
+  return { failed: result.failed, paused: result.succeeded };
 }
 
 /**
- * Retention purge (ADR 0038): devbox first, then the row (events/messages
- * cascade), then the purge notification whose ids are the removal event.
- * Any failure leaves the row for the next sweep — purge is idempotent.
+ * Delete paused terminal-task Devboxes after their runtime retention window.
+ * Task rows, events, messages, and deployment results are permanent records.
  */
-async function sweepRetentionPurge(
+async function sweepPausedDevboxDeletes(
   ctx: DeployTaskEngineContext
-): Promise<{ failed: number; purged: number }> {
-  const dueTasks = await ctx.db.execute(sql`
-    SELECT "id", "namespace", "project_uid", "runtime_name", "runtime_provider", "runtime_state"
-    FROM ${TASKS}
-    WHERE "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
-      AND "completed_at" IS NOT NULL
-      AND "completed_at" < now() - ${intervalFromMs(ctx.cadence.retentionMs)}
-    ORDER BY "completed_at" ASC
-    LIMIT ${ctx.cadence.purgeBatchSize}
+): Promise<{ deleted: number; failed: number }> {
+  const cleanupLeaseOwner = `${ctx.processId}:${randomUUID()}`;
+  const candidates = await ctx.db.execute(sql`
+    WITH candidates AS (
+      SELECT "id"
+      FROM ${TASKS}
+      WHERE "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})
+        AND "runtime_provider" = 'devbox'
+        AND "runtime_name" IS NOT NULL
+        AND lower(coalesce("runtime_state", '')) IN ('paused', 'archived')
+        AND "runtime_paused_at" IS NOT NULL
+        AND "runtime_paused_at" <= now() - ${intervalFromMs(ctx.cadence.devboxDeleteAfterPauseMs)}
+        AND (
+          "runtime_cleanup_lease_expires_at" IS NULL
+          OR "runtime_cleanup_lease_expires_at" <= now()
+        )
+      ORDER BY "runtime_paused_at" ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${ctx.cadence.devboxDeleteBatchSize}
+    )
+    UPDATE ${TASKS} task
+    SET "runtime_cleanup_lease_owner" = ${cleanupLeaseOwner},
+        "runtime_cleanup_lease_expires_at" = now() + ${intervalFromMs(ctx.cadence.leaseDurationMs)}
+    FROM candidates
+    WHERE task."id" = candidates."id"
+    RETURNING task."id", task."namespace", task."runtime_name"
   `);
-  let purged = 0;
-  let failed = 0;
-  for (const record of rowsOf(dueTasks)) {
-    const taskId = String(record.id);
-    const namespace = String(record.namespace ?? "");
-    const projectId =
-      record.project_uid == null ? null : String(record.project_uid);
-    try {
-      const runtimeName =
-        typeof record.runtime_name === "string" ? record.runtime_name : null;
-      const isDevbox = record.runtime_provider === "devbox";
-      const alreadyDeleted =
-        String(record.runtime_state ?? "").toLowerCase() === "deleted";
-      if (isDevbox && runtimeName != null && !alreadyDeleted) {
-        await ctx.devbox.deleteDevbox(namespace, runtimeName);
-        await markRuntimeState(ctx, taskId, "deleted");
-      }
-      await ctx.db.execute(
-        sql`DELETE FROM ${TASKS} WHERE "id" = ${taskId} AND "status" IN (${statusListSql(DEPLOY_TASK_TERMINAL_STATUSES)})`
-      );
-      purged += 1;
+  const result = await processWithConcurrency(
+    devboxRecordsOf(candidates),
+    ctx.cadence.devboxOperationConcurrency,
+    async (record) => {
       try {
-        await ctx.notify.publish({
-          kind: "purge",
-          namespace,
-          projectId,
-          taskId,
-        });
+        await ctx.devbox.deleteDevbox(record.namespace, record.runtimeName);
+        await markRuntimeState(
+          ctx,
+          record.taskId,
+          "deleted",
+          cleanupLeaseOwner
+        );
+        return true;
       } catch (error) {
-        console.error("[deploy-task-reaper] purge notify failed:", error);
+        try {
+          await releaseDevboxCleanupClaim(
+            ctx,
+            record.taskId,
+            cleanupLeaseOwner
+          );
+        } catch (releaseError) {
+          console.error(
+            `[deploy-task-reaper] cleanup claim release failed for task ${record.taskId}:`,
+            releaseError
+          );
+        }
+        console.error(
+          `[deploy-task-reaper] devbox delete failed for task ${record.taskId}:`,
+          error
+        );
+        return false;
       }
-    } catch (error) {
-      failed += 1;
-      console.error(
-        `[deploy-task-reaper] purge failed for task ${taskId}:`,
-        error
-      );
     }
-  }
-  return { failed, purged };
+  );
+  return { deleted: result.succeeded, failed: result.failed };
 }
 
 /**
@@ -353,6 +482,18 @@ export async function runDeployTaskReaperSweep(
     where: sql`${leased} AND "cancel_requested_at" IS NOT NULL AND "lease_expires_at" IS NOT NULL AND "lease_expires_at" < now()`,
   });
 
+  const timedOut = await sweepVerdict(ctx, {
+    error: timeoutMessage,
+    event: {
+      kind: "deployment_task.engine_resolved",
+      message: timeoutMessage,
+      payload: { reason: "timeout", verdict: "failed" },
+    },
+    failureDetails: { failureMessage: timeoutMessage, reason: "timeout" },
+    to: "failed",
+    where: sql`${leased} AND "cancel_requested_at" IS NULL AND "lease_claimed_at" IS NOT NULL AND "lease_claimed_at" < now() - ${intervalFromMs(ctx.cadence.maxActiveRunMs)}`,
+  });
+
   const interrupted = await sweepVerdict(ctx, {
     error: interruptedMessage,
     event: {
@@ -366,18 +507,6 @@ export async function runDeployTaskReaperSweep(
     },
     to: "failed",
     where: sql`${leased} AND "cancel_requested_at" IS NULL AND "lease_expires_at" IS NOT NULL AND "lease_expires_at" < now()`,
-  });
-
-  const timedOut = await sweepVerdict(ctx, {
-    error: timeoutMessage,
-    event: {
-      kind: "deployment_task.engine_resolved",
-      message: timeoutMessage,
-      payload: { reason: "timeout", verdict: "failed" },
-    },
-    failureDetails: { failureMessage: timeoutMessage, reason: "timeout" },
-    to: "failed",
-    where: sql`${leased} AND "cancel_requested_at" IS NULL AND "lease_claimed_at" IS NOT NULL AND "lease_claimed_at" < now() - ${intervalFromMs(ctx.cadence.maxActiveRunMs)}`,
   });
 
   const neverStarted = await sweepVerdict(ctx, {
@@ -402,18 +531,18 @@ export async function runDeployTaskReaperSweep(
   const invalidBlocked = await sweepInvalidBlockedTasks(ctx);
 
   const devboxSweep = await sweepTerminalDevboxPauses(ctx);
-  const purgeSweep = await sweepRetentionPurge(ctx);
+  const devboxDeleteSweep = await sweepPausedDevboxDeletes(ctx);
 
   return {
     cancelAckForced: cancelAckForced.length,
     devboxPauseFailed: devboxSweep.failed,
     devboxPaused: devboxSweep.paused,
+    devboxDeleteFailed: devboxDeleteSweep.failed,
+    devboxDeleted: devboxDeleteSweep.deleted,
     invalidBlocked,
     interrupted: interrupted.length,
     interruptedWithCancel: interruptedWithCancel.length,
     neverStarted: neverStarted.length,
-    purgeFailed: purgeSweep.failed,
-    purged: purgeSweep.purged,
     timedOut: timedOut.length,
   };
 }

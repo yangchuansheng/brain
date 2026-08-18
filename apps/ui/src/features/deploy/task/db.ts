@@ -1,15 +1,27 @@
 import "server-only";
 
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
-
+import { identityFingerprints } from "@/features/chat/persistence/schema";
+import {
+  marketingAttributionSubjects,
+  marketingLifecycleEvents,
+} from "@/features/marketing/schema";
 import { getAppPostgresPool } from "@/lib/app-postgres/db";
-
-import { deployTaskEvents, deployTaskMessages, deployTasks } from "./schema";
-
-const deploymentTaskSchema = {
+import {
+  deployTaskAgentCalls,
   deployTaskEvents,
   deployTaskMessages,
   deployTasks,
+} from "./schema";
+
+const deploymentTaskSchema = {
+  deployTaskAgentCalls,
+  deployTaskEvents,
+  deployTaskMessages,
+  deployTasks,
+  identityFingerprints,
+  marketingAttributionSubjects,
+  marketingLifecycleEvents,
 };
 
 export type { DeploymentTaskPgDatabase } from "./db-types";

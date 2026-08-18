@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ProjectCreator } from "./project-creator";
 
 const TRAIL_BACK_RE = />Back</;
-const DOCKER_DEPLOYER_RE = /data-slot="docker-deployer"/;
+const DOCKER_DEPLOYER_RE = /data-slot="docker-deployer-fields"/;
 const DOCKER_IMAGE_RE = /Docker image/;
 const PROJECT_NAME_RE = /Project Name/;
 const DESCRIPTION_RE = /Description/;
@@ -51,12 +51,8 @@ test("project creator description field warns on soft over-limit drafts", () => 
           pick: noop,
           reset: noop,
           setProjectDescription: noop,
-          setProjectDisplayName: noop,
           validateProjectDescription() {
             return "Project description must be 256 characters or fewer.";
-          },
-          validateProjectDisplayName() {
-            return null;
           },
         },
         meta: {
@@ -73,8 +69,6 @@ test("project creator description field warns on soft over-limit drafts", () => 
           projectDescription: "x".repeat(257),
           projectDescriptionError:
             "Project description must be 256 characters or fewer.",
-          projectDisplayName: "demo-project",
-          projectDisplayNameError: null,
           step: null,
         },
       }}

@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { render } from "@testing-library/react/pure";
+import { SidePane } from "@workspace/ui/components/side-pane";
 import { renderToStaticMarkup } from "react-dom/server";
 import { deploymentFailureMessage } from "@/features/deploy/task/failure-summary";
 import type { DeployTaskDTO } from "@/features/deploy/task/types";
+import {
+  actAndDrain,
+  installTestDom,
+  restoreActEnvironment,
+  setActEnvironment,
+} from "@/features/project-canvas/react-test-harness";
 import {
   DeploymentTaskTimelineActions,
   DeploymentTaskTimelinePaneContent,
@@ -24,6 +32,10 @@ const ANALYZE_REQUEST_RE = /Analyze request/;
 const SKIPPED_RE = /skipped/;
 const DEPLOYMENT_CONFIGURATION_RE = /Deployment configuration/;
 const AI_GATEWAY_KEY_RE = /AI Gateway API key/;
+const DEPLOYMENT_REGION_RE = /Deployment region/;
+const CHOICE_CONTROL_RE = /role="combobox"/;
+const PASSWORD_CONTROL_RE =
+  /<input(?=[^>]*name="ai_gateway_api_key")(?=[^>]*type="password")[^>]*>/;
 const CONTINUE_DEPLOYMENT_RE = /Continue Deployment/;
 const FIRECRAWL_API_KEY_RE = /FIRECRAWL_API_KEY/;
 const FIRECRAWL_API_KEY_DESCRIPTION_RE = /FIRECRAWL API KEY\./;
@@ -285,9 +297,18 @@ test("deployment task timeline pane renders template input form when blocked", (
                   sensitive: true,
                   type: "secret",
                 },
+                {
+                  default: "us-west-1",
+                  description: "Region for the deployment",
+                  key: "deployment_region",
+                  label: "Deployment region",
+                  options: ["us-west-1", "us-east-1"],
+                  required: true,
+                  type: "choice",
+                },
               ],
               kind: "sealos-template",
-              missingInputKeys: ["ai_gateway_api_key"],
+              missingInputKeys: ["ai_gateway_api_key", "deployment_region"],
               templateName: "ai-gateway",
             },
           },
@@ -295,8 +316,20 @@ test("deployment task timeline pane renders template input form when blocked", (
             {
               id: "ai_gateway_api_key",
               label: "AI Gateway API key",
+              options: ["generated-value"],
               required: true,
               type: "secret",
+            },
+            {
+              defaultValue: "us-west-1",
+              description: "Region for the deployment",
+              id: "deployment_region",
+              key: "deployment_region",
+              label: "Deployment region",
+              options: ["us-west-1", "us-east-1"],
+              required: true,
+              type: "text",
+              valueType: "choice",
             },
           ],
           canvasProjection: {},
@@ -348,6 +381,9 @@ test("deployment task timeline pane renders template input form when blocked", (
 
   assert.match(html, DEPLOYMENT_CONFIGURATION_RE);
   assert.match(html, AI_GATEWAY_KEY_RE);
+  assert.match(html, DEPLOYMENT_REGION_RE);
+  assert.match(html, CHOICE_CONTROL_RE);
+  assert.match(html, PASSWORD_CONTROL_RE);
   assert.match(html, CONTINUE_DEPLOYMENT_RE);
   assert.match(html, TIMELINE_DESIGN_CARD_STYLE_RE);
   assert.match(html, TIMELINE_BORDER_BEAM_RE);
@@ -707,4 +743,49 @@ test("deployment task timeline actions keep cancel visible but disabled on termi
   assert.equal((failed.match(DISABLED_ATTR_RE) ?? []).length, 1);
   // The confirm dialog only mounts after a click on the enabled button.
   assert.doesNotMatch(failed, CANCEL_DIALOG_SLOT_RE);
+});
+
+test("deployment task lifecycle actions pin in the side pane footer slot", async () => {
+  const dom = installTestDom();
+  const previousActEnvironment = setActEnvironment(true);
+  let rendered: ReturnType<typeof render> | undefined;
+  try {
+    await actAndDrain(() => {
+      rendered = render(
+        <SidePane
+          label="Deployment task timeline pane"
+          onClose={() => undefined}
+          title="Deployment Timeline"
+        >
+          <p>Timeline steps</p>
+          <DeploymentTaskTimelineActions
+            kubeconfig="kubeconfig"
+            namespace="default"
+            task={actionsTask("failed")}
+          />
+        </SidePane>
+      );
+    });
+    const container = rendered?.container;
+    assert.ok(container);
+    const footer = container.querySelector('[data-slot="side-pane-footer"]');
+    assert.ok(footer, "the lifecycle action row opens the footer region");
+    assert.ok(
+      footer.querySelector('[data-slot="deployment-task-actions"]'),
+      "the action row lands in the footer slot"
+    );
+    assert.equal(
+      footer.closest(".overflow-y-auto"),
+      null,
+      "the footer stays outside the scroll container"
+    );
+  } finally {
+    if (rendered) {
+      await actAndDrain(() => {
+        rendered?.unmount();
+      });
+    }
+    restoreActEnvironment(previousActEnvironment);
+    await dom.restore();
+  }
 });

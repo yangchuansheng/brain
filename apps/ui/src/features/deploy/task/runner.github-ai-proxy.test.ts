@@ -13,6 +13,7 @@ import type { DeployTaskRow } from "./schema";
 
 const requireModule = createRequire(import.meta.url);
 const originalFetch = globalThis.fetch;
+const PINNED_SKILL_COMMIT_SOURCE_RE = /sealos-skills\.git#[0-9a-f]{7,}/;
 const ENV_KEYS = [
   "AI_PROXY_TOKEN_NAME",
   "CODEX_GATEWAY_MODEL",
@@ -25,6 +26,8 @@ const ENV_KEYS = [
   "DEVBOX_TOKEN",
   "SYSTEM_OPENAI_API_KEY",
   "SYSTEM_OPENAI_API_BASE_URL",
+  "SEALAI_DEPLOY_LABELS_JSON",
+  "SEALAI_PROJECT_ID",
 ] as const;
 const originalEnv = Object.fromEntries(
   ENV_KEYS.map((key) => [key, process.env[key]])
@@ -34,9 +37,16 @@ mock.module("server-only", () => ({}));
 
 const {
   buildCodexGatewayEnv,
+  buildDeploySkillInstallCommand,
+  buildManagedWorkspacePurgeCommand,
+  createManagedDeploymentLifecycleState,
+  enterManagedDeploymentRepair,
   ensureAiDeploymentDevbox,
-  resolveGithubCodexGatewayCredentials,
+  resolveCodexGatewayCredentials,
 } = requireModule("./runner") as typeof import("./runner");
+const { getDeploySkillSourceFromEnv } = requireModule(
+  "./runtime-config"
+) as typeof import("./runtime-config");
 const {
   CodexGatewayApiError,
   CodexGatewayTimeoutError,
@@ -103,6 +113,69 @@ function devbox(name: string, phase = "Running") {
   };
 }
 
+describe("deploy skill installation", () => {
+  it("installs from the configured branch source without pinning a commit", () => {
+    const command = buildDeploySkillInstallCommand(
+      "https://github.com/labring/sealos-skills/tree/brain-deploy-preview"
+    );
+
+    expect(command).toContain(
+      "https://github.com/labring/sealos-skills/tree/brain-deploy-preview"
+    );
+    expect(command).toContain('npx --yes skills@1.5.20 add "$skill_source" -y');
+    expect(command).toContain("k8s-kaniko-job/SKILL.md");
+    expect(command).toContain(
+      "for skill_name in sealos-deploy dockerfile-skill k8s-kaniko-job cloud-native-readiness docker-to-sealos"
+    );
+    expect(command).not.toContain("deploy-skills-revision");
+    expect(command).not.toMatch(PINNED_SKILL_COMMIT_SOURCE_RE);
+  });
+
+  it("defaults to sealos-skills main via runtime config", () => {
+    expect(getDeploySkillSourceFromEnv({})).toBe(
+      "https://github.com/labring/sealos-skills.git#main"
+    );
+    const command = buildDeploySkillInstallCommand(
+      getDeploySkillSourceFromEnv({})
+    );
+    expect(command).toContain(
+      "https://github.com/labring/sealos-skills.git#main"
+    );
+  });
+});
+
+describe("managed deployment workspace cleanup", () => {
+  it("purges and verifies only the fixed task workspace", () => {
+    const command = buildManagedWorkspacePurgeCommand();
+
+    expect(command).toContain("/home/devbox/project");
+    expect(command).toContain("-mindepth 1 -maxdepth 1");
+    expect(command).toContain("rm -rf");
+    expect(command).toContain("-print -quit");
+    expect(command).not.toContain("/home/devbox/project/.sealos/brain");
+  });
+
+  it("keeps submitted inputs available across repair turns", () => {
+    const submitted = createManagedDeploymentLifecycleState("input-submitted");
+    const repair = enterManagedDeploymentRepair(submitted);
+
+    expect(repair).toEqual({
+      inputsSubmitted: true,
+      resumeMode: "repair",
+    });
+  });
+
+  it("does not invent submitted inputs for an initial repair", () => {
+    const initial = createManagedDeploymentLifecycleState("initial");
+    const repair = enterManagedDeploymentRepair(initial);
+
+    expect(repair).toEqual({
+      inputsSubmitted: false,
+      resumeMode: "repair",
+    });
+  });
+});
+
 function githubTask(runtimeName: string | null): DeployTaskRow {
   return {
     artifactSummary: {},
@@ -128,6 +201,13 @@ function githubTask(runtimeName: string | null): DeployTaskRow {
   } as unknown as DeployTaskRow;
 }
 
+function promptTask(runtimeName: string | null): DeployTaskRow {
+  return {
+    ...githubTask(runtimeName),
+    source: { kind: "prompt", text: "Deploy a small web application" },
+  } as DeployTaskRow;
+}
+
 function setPlatformCredentials() {
   process.env.CODEX_GATEWAY_OPENAI_API_KEY = "gateway-platform-key";
   process.env.CODEX_GATEWAY_OPENAI_BASE_URL =
@@ -138,7 +218,7 @@ function setPlatformCredentials() {
   process.env.SYSTEM_OPENAI_API_BASE_URL = "https://system-platform.example/v1";
 }
 
-describe("GitHub deployment AI Proxy credentials", () => {
+describe("deployment AI Proxy credentials", () => {
   beforeEach(() => {
     setPlatformCredentials();
     process.env.AI_PROXY_TOKEN_NAME = "github-deploy-token";
@@ -146,6 +226,8 @@ describe("GitHub deployment AI Proxy credentials", () => {
     delete process.env.DEPLOY_DEVBOX_STORAGE_LIMIT;
     process.env.DEVBOX_API_BASE_URL = "https://devbox.test";
     process.env.DEVBOX_TOKEN = "devbox-test-token";
+    process.env.DEPLOY_AGENT_MCP_URL =
+      "https://brain.test/api/deploy-agent/mcp/v1";
   });
 
   afterEach(() => {
@@ -176,7 +258,7 @@ describe("GitHub deployment AI Proxy credentials", () => {
       status: 200,
     });
 
-    const credentials = await resolveGithubCodexGatewayCredentials({
+    const credentials = await resolveCodexGatewayCredentials({
       encodedKubeconfig,
       kubeconfig: kubeconfigText,
     });
@@ -202,14 +284,14 @@ describe("GitHub deployment AI Proxy credentials", () => {
     });
   });
 
-  it("never falls back to platform credentials for a GitHub deployment", async () => {
+  it("never falls back to platform credentials for an AI deployment", async () => {
     const kubeconfigText = kubeconfig();
     installFetchResponse({
       body: JSON.stringify({ key: "user-only-key" }),
       status: 200,
     });
 
-    const credentials = await resolveGithubCodexGatewayCredentials({
+    const credentials = await resolveCodexGatewayCredentials({
       encodedKubeconfig: encodeURIComponent(kubeconfigText),
       kubeconfig: kubeconfigText,
     });
@@ -231,13 +313,13 @@ describe("GitHub deployment AI Proxy credentials", () => {
       status: 503,
     });
 
-    const result = resolveGithubCodexGatewayCredentials({
+    const result = resolveCodexGatewayCredentials({
       encodedKubeconfig: encodeURIComponent(kubeconfigText),
       kubeconfig: kubeconfigText,
     });
 
     await expect(result).rejects.toThrow(
-      "Could not obtain the user's AI Proxy key for GitHub deployment (HTTP 503)."
+      "Could not obtain the user's AI Proxy key for deployment (HTTP 503)."
     );
     await expect(result).rejects.not.toThrow("upstream-secret-response");
   });
@@ -252,7 +334,7 @@ describe("GitHub deployment AI Proxy credentials", () => {
       status: 200,
     });
 
-    const result = resolveGithubCodexGatewayCredentials({
+    const result = resolveCodexGatewayCredentials({
       encodedKubeconfig: "invalid-kubeconfig",
       kubeconfig: "not: [valid",
     });
@@ -296,6 +378,7 @@ describe("GitHub deployment AI Proxy credentials", () => {
       encodedKubeconfig: "invalid-when-unused",
       kubeconfig: "invalid-when-unused",
       task: githubTask("existing-devbox"),
+      taskDeadlineAtMs: Date.now() + 60_000,
     });
 
     expect(runtime.name).toBe("existing-devbox");
@@ -308,6 +391,80 @@ describe("GitHub deployment AI Proxy credentials", () => {
     expect(requests.some((request) => request.url.endsWith("/resume"))).toBe(
       true
     );
+  });
+
+  it("propagates an abort signal into an in-flight Devbox request", async () => {
+    const controller = new AbortController();
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      requestStarted = resolve;
+    });
+    installFetchHandler(
+      (request) =>
+        new Promise<Response>((_resolve, reject) => {
+          requestStarted();
+          const onAbort = () => {
+            reject(request.signal.reason);
+          };
+          request.signal.addEventListener("abort", onAbort, { once: true });
+        })
+    );
+
+    const pending = ensureAiDeploymentDevbox({
+      deadlineAtMs: Date.now() + 60_000,
+      encodedKubeconfig: "invalid-when-unused",
+      kubeconfig: "invalid-when-unused",
+      signal: controller.signal,
+      task: githubTask("existing-devbox"),
+      taskDeadlineAtMs: Date.now() + 60_000,
+    });
+    await started;
+    controller.abort(new Error("devbox deadline reached"));
+
+    await expect(pending).rejects.toThrow("devbox deadline reached");
+  });
+
+  it("aborts an in-flight AI Proxy token request before creating a Devbox", async () => {
+    const controller = new AbortController();
+    let tokenRequestStarted!: () => void;
+    const tokenRequestStart = new Promise<void>((resolve) => {
+      tokenRequestStarted = resolve;
+    });
+    let createDevboxCalled = false;
+    installFetchHandler((request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/v1/devbox" && request.method === "GET") {
+        return devboxEnvelope({ items: [] });
+      }
+      if (url.hostname === "aiproxy-web.test.sealos.io") {
+        tokenRequestStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            "abort",
+            () => reject(request.signal.reason),
+            { once: true }
+          );
+        });
+      }
+      if (url.pathname === "/api/v1/devbox" && request.method === "POST") {
+        createDevboxCalled = true;
+      }
+      return new Response("unexpected request", { status: 500 });
+    });
+
+    const pending = ensureAiDeploymentDevbox({
+      deadlineAtMs: Date.now() + 60_000,
+      encodedKubeconfig: encodeURIComponent(kubeconfig()),
+      kubeconfig: kubeconfig(),
+      signal: controller.signal,
+      task: githubTask(null),
+      taskDeadlineAtMs: Date.now() + 60_000,
+    });
+    await tokenRequestStart;
+    controller.abort(new Error("prepare deadline reached"));
+
+    await expect(pending).rejects.toThrow("prepare deadline reached");
+    expect(createDevboxCalled).toBe(false);
   });
 
   it("reuses a Devbox found by upstream ID without requesting AI Proxy credentials", async () => {
@@ -331,6 +488,7 @@ describe("GitHub deployment AI Proxy credentials", () => {
       encodedKubeconfig: "invalid-when-unused",
       kubeconfig: "invalid-when-unused",
       task: githubTask(null),
+      taskDeadlineAtMs: Date.now() + 60_000,
     });
 
     expect(runtime.name).toBe("listed-devbox");
@@ -341,7 +499,21 @@ describe("GitHub deployment AI Proxy credentials", () => {
     ]);
   });
 
-  it("requests AI Proxy credentials only when creating a Devbox", async () => {
+  it("rejects managed deployments without a Brain project ID", async () => {
+    const task = githubTask(null);
+    task.projectId = null;
+
+    await expect(
+      ensureAiDeploymentDevbox({
+        encodedKubeconfig: encodeURIComponent(kubeconfig()),
+        kubeconfig: kubeconfig(),
+        task,
+        taskDeadlineAtMs: Date.now() + 60_000,
+      })
+    ).rejects.toThrow("Managed deployment requires a Brain project ID.");
+  });
+
+  it("creates prompt deployment Devboxes with Agent and user AI Proxy env", async () => {
     const requests: Request[] = [];
     let createdEnv: Record<string, string> | undefined;
     let createdStorageLimit: string | undefined;
@@ -378,7 +550,8 @@ describe("GitHub deployment AI Proxy credentials", () => {
     const runtime = await ensureAiDeploymentDevbox({
       encodedKubeconfig: encodeURIComponent(kubeconfig()),
       kubeconfig: kubeconfig(),
-      task: githubTask(null),
+      task: promptTask(null),
+      taskDeadlineAtMs: Date.now() + 60_000,
     });
 
     expect(runtime.name).toStartWith("sealai-deploy-");
@@ -391,6 +564,13 @@ describe("GitHub deployment AI Proxy credentials", () => {
     expect(createdEnv).toMatchObject({
       CODEX_GATEWAY_OPENAI_API_KEY: "new-user-key",
       CODEX_GATEWAY_OPENAI_BASE_URL: "https://aiproxy.test.sealos.io/v1",
+      SEALAI_DEPLOY_MODE: "managed",
+      SEALAI_PROJECT_ID: "project-1",
+      SEALAI_DEPLOY_LABELS_JSON: JSON.stringify({
+        "brain.io/managed-by": "brain",
+        "brain.io/project-id": "project-1",
+        "brain.io/deployment-kind": "template",
+      }),
     });
     expect(createdStorageLimit).toBe("10Gi");
   });

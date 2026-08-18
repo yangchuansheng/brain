@@ -1,6 +1,11 @@
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
-
+import type { identityFingerprints } from "@/features/chat/persistence/schema";
 import type {
+  marketingAttributionSubjects,
+  marketingLifecycleEvents,
+} from "@/features/marketing/schema";
+import type {
+  deployTaskAgentCalls,
   deployTaskEvents,
   deployTaskMessages,
   deployTasks,
@@ -8,9 +13,13 @@ import type {
 
 // biome-ignore lint/style/useConsistentTypeDefinitions: interfaces lack the implicit index signature PgDatabase's schema generic requires
 export type DeploymentTaskDbSchema = {
+  deployTaskAgentCalls: typeof deployTaskAgentCalls;
   deployTaskEvents: typeof deployTaskEvents;
   deployTaskMessages: typeof deployTaskMessages;
   deployTasks: typeof deployTasks;
+  identityFingerprints: typeof identityFingerprints;
+  marketingAttributionSubjects: typeof marketingAttributionSubjects;
+  marketingLifecycleEvents: typeof marketingLifecycleEvents;
 };
 
 /**

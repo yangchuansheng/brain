@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   assertProjectHasNoManagedResources,
   deleteProjectManagedResources,
+  inspectProjectManagedResources,
   ProjectDeleteBlockedError,
   type ProjectDeleteFetch,
   ProjectManagedResourceCleanupError,
@@ -130,6 +131,31 @@ test("project delete guard allows deletion when no managed resources exist", asy
   });
 });
 
+test("project deletion inspection returns the complete scope without deleting", async () => {
+  const calls: string[] = [];
+  const summary = await inspectProjectManagedResources({
+    apiBaseUrl: "https://brain.test",
+    encodedKubeconfig: "kubeconfig",
+    fetchImpl: (url, init) => {
+      calls.push(`${init?.method ?? "GET"} ${String(url)}`);
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ items: managedResourceItems(new URL(String(url))) }),
+          { status: 200 }
+        )
+      );
+    },
+    id: "project-a",
+    namespace: "ns-a",
+  });
+
+  assert.equal(calls.length, 16);
+  assert.ok(calls.every((call) => call.startsWith("GET ")));
+  assert.deepEqual(summary.ap, ["api"]);
+  assert.deepEqual(summary.db, ["postgres"]);
+  assert.deepEqual(summary.template, ["template-memos"]);
+});
+
 test("project delete guard does not double encode kubeconfig authorization", async () => {
   const calls: string[] = [];
   const encodedKubeconfig = encodeURIComponent(
@@ -158,26 +184,36 @@ test("project delete guard does not double encode kubeconfig authorization", asy
 });
 
 test("project delete guard requires an API base URL", async () => {
-  await assert.rejects(
-    () =>
-      assertProjectHasNoManagedResources({
-        encodedKubeconfig: "kubeconfig",
-        fetchImpl: () =>
-          Promise.resolve(
-            new Response(JSON.stringify({ items: [] }), { status: 200 })
-          ),
-        id: "project-a",
-        namespace: "ns-a",
-      }),
-    (error) => {
-      assert.equal(error instanceof ProjectManagedResourceCleanupError, true);
-      assert.equal(
-        (error as ProjectManagedResourceCleanupError).message,
-        "API_URL is required to clean up project resources."
-      );
-      return true;
+  const previousApiUrl = process.env.API_URL;
+  delete process.env.API_URL;
+  try {
+    await assert.rejects(
+      () =>
+        assertProjectHasNoManagedResources({
+          encodedKubeconfig: "kubeconfig",
+          fetchImpl: () =>
+            Promise.resolve(
+              new Response(JSON.stringify({ items: [] }), { status: 200 })
+            ),
+          id: "project-a",
+          namespace: "ns-a",
+        }),
+      (error) => {
+        assert.equal(error instanceof ProjectManagedResourceCleanupError, true);
+        assert.equal(
+          (error as ProjectManagedResourceCleanupError).message,
+          "API_URL is required to clean up project resources."
+        );
+        return true;
+      }
+    );
+  } finally {
+    if (previousApiUrl === undefined) {
+      delete process.env.API_URL;
+    } else {
+      process.env.API_URL = previousApiUrl;
     }
-  );
+  }
 });
 
 test("project delete guard surfaces downstream cleanup errors", async () => {

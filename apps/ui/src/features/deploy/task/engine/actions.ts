@@ -1,10 +1,12 @@
 import { generateId } from "ai";
 import { and, eq, inArray } from "drizzle-orm";
-
+import { normalizeMarketingAttribution } from "@/features/marketing/consent";
+import { requireCurrentIdentityBinding } from "@/lib/identity-fingerprint-core";
 import { isCurrentDeploymentCredentialBinding } from "../credential-binding";
 import { getDeployTaskRowInNamespace } from "../lookup";
 import { publicDeployTaskBlockingInputs } from "../public-artifact-summary";
 import {
+  CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
   type DeploymentTaskSource,
   type DeployTaskBlockingInput,
   type DeployTaskRow,
@@ -18,7 +20,10 @@ import {
 } from "../sensitive-inputs";
 import { DEPLOY_TASK_ACTIVE_STATUSES } from "../status-presentation";
 import { createDeploymentTaskTimelineForRunner } from "../timeline";
-import type { CreateDeployTaskInput } from "../types";
+import type {
+  CreateDeployTaskInput,
+  DeployTaskTargetResolution,
+} from "../types";
 import type { DeployTaskEngineContext } from "./context";
 import type { DeployTaskHandle } from "./handle";
 import {
@@ -95,7 +100,10 @@ function taskTitle(input: CreateDeployTaskInput): string {
     );
     return project ? `Deploy ${source} into ${project}` : `Deploy ${source}`;
   }
-  return `Deploy ${source} into new Project ${input.target.displayName}`;
+  const displayName = compactOptional(input.target.displayName);
+  return displayName == null
+    ? `Deploy ${source} into a new Project`
+    : `Deploy ${source} into new Project ${displayName}`;
 }
 
 async function readTaskRow(
@@ -151,7 +159,8 @@ export type CreateDeployTaskActionResult =
     }
   | { kind: "invalid"; message: string }
   | { kind: "predecessor-conflict"; predecessor: DeployTaskRow }
-  | { kind: "predecessor-not-found" };
+  | { kind: "predecessor-not-found" }
+  | { displayName: string; kind: "project-name-conflict" };
 
 export type CreateDeployTaskActionCreateInput = Omit<
   CreateDeployTaskInput,
@@ -169,8 +178,9 @@ export interface CreateDeployTaskActionInput {
    */
   resolveTarget?: (input: {
     namespace: string;
+    source: NonNullable<CreateDeployTaskInput["source"]>;
     target: NonNullable<CreateDeployTaskInput["target"]>;
-  }) => Promise<{ projectId: string; projectName: string }>;
+  }) => Promise<DeployTaskTargetResolution>;
   /** Launches the runner under the inline-claimed lease. */
   run: DeployTaskRunLauncher;
 }
@@ -232,10 +242,30 @@ async function resolveCreateInputs(
       message: "Deploy task creation requires source, runner, and target.",
     };
   }
+  const inheritedAttribution = predecessor?.marketingAttribution ?? undefined;
+  let marketingAttribution: DeployTaskRow["marketingAttribution"] | undefined;
+  if (input.create.marketingAttribution != null) {
+    marketingAttribution = await normalizeMarketingAttribution(
+      input.create.marketingAttribution,
+      input.create.marketingConsentSubject
+    );
+  } else if (
+    inheritedAttribution?.consent_provenance == null ||
+    inheritedAttribution.consent_provenance.subject_id ===
+      input.create.marketingConsentSubject
+  ) {
+    marketingAttribution = inheritedAttribution;
+  } else {
+    marketingAttribution = await normalizeMarketingAttribution(
+      inheritedAttribution,
+      undefined
+    );
+  }
   const create: CreateDeployTaskInput = {
     createdFrom: input.create.createdFrom,
     creatingActor: input.create.creatingActor,
     credentialBinding: input.create.credentialBinding,
+    marketingAttribution,
     namespace: input.create.namespace,
     prompt: input.create.prompt,
     runner,
@@ -261,10 +291,11 @@ function invalidCredentialBinding(
   if (creatingActor === "" || binding == null) {
     return "GitHub deployment requires a verified creator and credential binding.";
   }
-  if (
-    !isCurrentDeploymentCredentialBinding(binding) ||
-    binding.credentialOwner.trim() !== creatingActor
-  ) {
+  // The binding's owner is the initiator's global userUid, proven by the app
+  // token at the route's authorization point (ADR-0059). The per-region
+  // creatingActor and the uid are disjoint identifier spaces, so
+  // owner-equals-creator is no longer checkable here.
+  if (!isCurrentDeploymentCredentialBinding(binding)) {
     return "GitHub deployment credential binding is invalid.";
   }
   return null;
@@ -306,10 +337,11 @@ function cloneInheritedIdentities(
 async function resolveCreateProject(
   input: CreateDeployTaskActionInput,
   create: CreateDeployTaskInput
-): Promise<{ projectId: string; projectName: string } | null> {
+): Promise<DeployTaskTargetResolution | null> {
   const target = create.target;
   if (target.kind === "existingProject" && target.projectName?.trim()) {
     return {
+      kind: "resolved",
       projectId: target.projectId,
       projectName: target.projectName.trim(),
     };
@@ -317,6 +349,7 @@ async function resolveCreateProject(
   if (input.resolveTarget != null) {
     return await input.resolveTarget({
       namespace: create.namespace.trim(),
+      source: create.source,
       target,
     });
   }
@@ -335,63 +368,71 @@ function createdTaskEventPayload(
   };
 }
 
-export async function createDeployTaskAction(
+async function insertCreatedDeployTask(
   ctx: DeployTaskEngineContext,
-  input: CreateDeployTaskActionInput
-): Promise<CreateDeployTaskActionResult> {
-  const resolved = await resolveCreateInputs(ctx, input);
-  if ("kind" in resolved) {
-    return resolved;
+  input: {
+    create: CreateDeployTaskInput;
+    predecessor: DeployTaskRow | null;
+    resolvedProject: { projectId: string; projectName: string } | null;
   }
-  const { create, predecessor } = resolved;
-  const resolvedProject = await resolveCreateProject(input, create);
-
+): Promise<
+  DeployTaskRow | { kind: "clone-conflict"; activeClone: DeployTaskRow | null }
+> {
+  const { create, predecessor, resolvedProject } = input;
   const id = generateId();
   const now = new Date();
   const persistedSource = persistableDeploymentSource(create.source);
-  const timelineSnapshot = createDeploymentTaskTimelineForRunner({
-    runner: create.runner,
-    source: persistedSource,
-    status: "queued",
-    taskId: id,
-    updatedAt: now.toISOString(),
-  });
-
   const inheritedIdentities = cloneInheritedIdentities(create, predecessor);
-  let task: DeployTaskRow;
   try {
-    const [inserted] = await ctx.db
-      .insert(deployTasks)
-      .values({
-        id,
-        actorUserId: null,
-        artifactSummary:
-          inheritedIdentities == null
-            ? {}
-            : { resultIdentities: inheritedIdentities },
-        createdAt: now,
-        createdFrom: create.createdFrom ?? "api",
-        creatingActor: create.creatingActor?.trim() || null,
-        credentialBinding: create.credentialBinding ?? null,
-        githubConnectionId: null,
-        namespace: create.namespace.trim(),
-        phase: "queued",
-        projectId: resolvedProject?.projectId ?? null,
-        projectName: resolvedProject?.projectName ?? null,
-        prompt: compactOptional(create.prompt) ?? taskTitle(create),
-        retriedFromTaskId: predecessor?.id ?? null,
-        runner: create.runner,
-        source: persistedSource,
-        status: "queued",
-        target: create.target,
-        timelineSnapshot,
-        updatedAt: now,
-      })
-      .returning();
+    const [inserted] = await ctx.db.transaction(async (tx) => {
+      const provenance = create.marketingAttribution?.consent_provenance;
+      if (provenance != null) {
+        await requireCurrentIdentityBinding(tx, {
+          crName: create.creatingActor ?? "",
+          userUid: provenance.subject_id,
+        });
+      }
+      return tx
+        .insert(deployTasks)
+        .values({
+          id,
+          actorUserId: null,
+          agentProtocol: "mcp-v1",
+          artifactSummary:
+            inheritedIdentities == null
+              ? {}
+              : { resultIdentities: inheritedIdentities },
+          createdAt: now,
+          createdFrom: create.createdFrom ?? "api",
+          creatingActor: create.creatingActor?.trim() || null,
+          credentialBinding: create.credentialBinding ?? null,
+          marketingAttribution: create.marketingAttribution ?? null,
+          githubConnectionId: null,
+          namespace: create.namespace.trim(),
+          phase: "queued",
+          projectId: resolvedProject?.projectId ?? null,
+          projectName: resolvedProject?.projectName ?? null,
+          prompt: compactOptional(create.prompt) ?? taskTitle(create),
+          retriedFromTaskId: predecessor?.id ?? null,
+          runner: create.runner,
+          source: persistedSource,
+          status: "queued",
+          target: create.target,
+          timelineSnapshot: createDeploymentTaskTimelineForRunner({
+            runner: create.runner,
+            source: persistedSource,
+            status: "queued",
+            taskId: id,
+            updatedAt: now.toISOString(),
+          }),
+          updatedAt: now,
+        })
+        .returning();
+    });
     if (inserted == null) {
       throw new Error("Failed to create deploy task.");
     }
-    task = inserted;
+    return inserted;
   } catch (error) {
     if (
       predecessor != null &&
@@ -411,6 +452,30 @@ export async function createDeployTaskAction(
       return { kind: "clone-conflict", activeClone: activeClone ?? null };
     }
     throw error;
+  }
+}
+
+export async function createDeployTaskAction(
+  ctx: DeployTaskEngineContext,
+  input: CreateDeployTaskActionInput
+): Promise<CreateDeployTaskActionResult> {
+  const resolved = await resolveCreateInputs(ctx, input);
+  if ("kind" in resolved) {
+    return resolved;
+  }
+  const { create, predecessor } = resolved;
+  const resolution = await resolveCreateProject(input, create);
+  if (resolution?.kind === "project-name-conflict") {
+    return resolution;
+  }
+
+  const task = await insertCreatedDeployTask(ctx, {
+    create,
+    predecessor,
+    resolvedProject: resolution,
+  });
+  if ("kind" in task) {
+    return task;
   }
 
   await ctx.db.insert(deployTaskMessages).values({
@@ -487,6 +552,7 @@ async function cancelParkedTask(
       },
     },
     from: [from],
+    set: { agentControlTokenRevokedAt: new Date() },
     taskId,
     to: "cancelled",
   });
@@ -614,21 +680,15 @@ function isSubmittedScalar(value: unknown): value is string | number | boolean {
 function submittedInputValues(
   blockingInputs: DeployTaskBlockingInput[],
   values: Record<string, unknown>,
-  publicBlockingInputs: DeployTaskBlockingInput[],
-  strictPublicIdentifiers: boolean
+  options: { allowInternalIdFallback: boolean }
 ): Record<string, string | number | boolean> {
   return Object.fromEntries(
-    blockingInputs.flatMap((item, index) => {
+    blockingInputs.flatMap((item) => {
       const canonicalKey = item.key ?? item.id;
-      const publicInput = publicBlockingInputs[index];
-      const publicKey = publicInput?.key ?? publicInput?.id;
-      const candidates = strictPublicIdentifiers
-        ? [publicKey]
-        : [canonicalKey, item.id];
-      for (const candidate of new Set(candidates)) {
-        if (candidate == null) {
-          continue;
-        }
+      const candidates = options.allowInternalIdFallback
+        ? new Set([canonicalKey, item.id])
+        : [canonicalKey];
+      for (const candidate of candidates) {
         const value = values[candidate];
         if (isSubmittedScalar(value)) {
           return [[canonicalKey, value]];
@@ -664,17 +724,11 @@ function shortSensitiveSubmittedKey(
 
 function submittedEventInputKeys(input: {
   blockingInputs: DeployTaskBlockingInput[];
-  publicBlockingInputs: DeployTaskBlockingInput[];
   submittedValues: Record<string, string | number | boolean>;
 }): string[] {
-  return input.blockingInputs.flatMap((item, index) =>
+  return input.blockingInputs.flatMap((item) =>
     Object.hasOwn(input.submittedValues, item.key ?? item.id)
-      ? [
-          input.publicBlockingInputs[index]?.key ??
-            input.publicBlockingInputs[index]?.id ??
-            item.key ??
-            item.id,
-        ]
+      ? [item.key ?? item.id]
       : []
   );
 }
@@ -701,9 +755,9 @@ function hasUniqueCanonicalBlockingInputKeys(
 
 /**
  * Blocking Input submission performs the blocked → running claim itself and
- * hands values to the runner in process memory; only redacted key names are
- * ever persisted (ADR 0037). The legacy failed-at-configure resume path is
- * gone: blocked is the only waiting state.
+ * hands values to the runner in process memory; canonical key names may be
+ * persisted, but submitted values never are (ADR 0037). The legacy
+ * failed-at-configure resume path is gone: blocked is the only waiting state.
  */
 export async function submitDeployTaskInputAction(
   ctx: DeployTaskEngineContext,
@@ -726,7 +780,12 @@ export async function submitDeployTaskInputAction(
   }
   const publicBlockingInputs = publicDeployTaskBlockingInputs(
     currentBlockingInputs,
-    { runner: row.runner }
+    {
+      runner: row.runner,
+      trustedMetadata:
+        row.artifactSummary.publicProjectionVersion ===
+        CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    }
   );
   if (publicBlockingInputs.length !== currentBlockingInputs.length) {
     return {
@@ -738,8 +797,7 @@ export async function submitDeployTaskInputAction(
   const submittedValues = submittedInputValues(
     currentBlockingInputs,
     input.values,
-    publicBlockingInputs,
-    row.runner.kind === "ai"
+    { allowInternalIdFallback: row.runner.kind !== "ai" }
   );
   const submittedInputKeys = Object.keys(submittedValues);
   if (submittedInputKeys.length === 0) {
@@ -756,23 +814,22 @@ export async function submitDeployTaskInputAction(
       task: row,
     };
   }
-  const shortSensitiveKey = shortSensitiveSubmittedKey(
-    currentBlockingInputs,
-    submittedValues
-  );
+  // AI Template declarations are public configuration. Their field names and
+  // control type do not prove that a submitted scalar is a secret; values are
+  // request-memory-only for this path, so no heuristic length gate applies.
+  const shortSensitiveKey =
+    row.runner.kind === "ai"
+      ? null
+      : shortSensitiveSubmittedKey(currentBlockingInputs, submittedValues);
   if (shortSensitiveKey != null) {
     return {
       kind: "invalid-input",
-      message:
-        row.runner.kind === "ai"
-          ? `Sensitive deployment inputs must be at least ${MIN_SENSITIVE_INPUT_LENGTH} characters.`
-          : `Deployment input "${shortSensitiveKey}" must be at least ${MIN_SENSITIVE_INPUT_LENGTH} characters.`,
+      message: `Deployment input "${shortSensitiveKey}" must be at least ${MIN_SENSITIVE_INPUT_LENGTH} characters.`,
       task: row,
     };
   }
   const eventInputKeys = submittedEventInputKeys({
     blockingInputs: currentBlockingInputs,
-    publicBlockingInputs,
     submittedValues,
   });
 

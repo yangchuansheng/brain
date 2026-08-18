@@ -12,6 +12,7 @@ node_modules
 
 # Testing
 coverage
+output/playwright/
 
 # Local migration snapshots and manifests
 apps/ui/.migration/
@@ -57,8 +58,6 @@ packages/crossplane/public/service/ap/templates/.venv-sync/
 main
 apps/api/api
 
-.sandcastle
-CONTEXT.md
 specs/*
 !specs/model-github-integrations-as-namespace-scoped-app-installations.md
 .playwright-mcp

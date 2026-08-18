@@ -8,19 +8,23 @@ import { getAppPostgresPool } from "@/lib/app-postgres/db";
 import {
   assistantChatMessages,
   assistantChats,
+  assistantDevboxRuntimes,
   assistantEntitlements,
   githubAppInstallSessions,
   githubConnections,
   githubOauthConnections,
+  identityFingerprints,
 } from "./schema";
 
 const assistantSchema = {
   assistantChatMessages,
   assistantChats,
+  assistantDevboxRuntimes,
   assistantEntitlements,
   githubAppInstallSessions,
   githubConnections,
   githubOauthConnections,
+  identityFingerprints,
 };
 
 export type AssistantPgDatabase = PgDatabase<

@@ -1,10 +1,9 @@
 "use client";
 
-import { SidePane } from "@workspace/ui/components/side-pane";
+import { SidePane, SidePaneFooter } from "@workspace/ui/components/side-pane";
 import { Blocks } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { createDeploymentTargetClientAdapters } from "@/features/deploy/client-adapters";
 import {
   type DeploymentTaskEditRedeploy,
   useRedeployOverwriteGate,
@@ -17,6 +16,7 @@ import { dispatchDeployTaskCreatedEvent } from "@/features/deploy/task/browser-e
 import type { TemplateDeploymentSettings } from "@/features/deploy/template-deployer";
 import { TemplateDeployer } from "@/features/deploy/template-deployer";
 import { useCurrentProjectDisplayName } from "@/features/deploy/use-current-project-display-name";
+import { useDeploymentTargetAdapters } from "@/features/deploy/use-deployment-target-adapters";
 import { useTemplateCatalog } from "@/features/deploy/use-template-catalog";
 import { errorDescription, toastErrorDetail } from "@/lib/toast-utils";
 
@@ -42,10 +42,10 @@ export function TemplateDeploymentPane({
     projectId,
   });
   const templateCatalog = useTemplateCatalog();
-  const deploymentAdapters = useMemo(
-    () => createDeploymentTargetClientAdapters({ kubeconfig, namespace }),
-    [kubeconfig, namespace]
-  );
+  const deploymentAdapters = useDeploymentTargetAdapters({
+    kubeconfig,
+    namespace,
+  });
   const projectName = currentProject.resourceName?.trim() ?? "";
   const overwriteGate = useRedeployOverwriteGate(
     redeploy?.overwriteWarning ?? false
@@ -130,11 +130,10 @@ export function TemplateDeploymentPane({
       }
       title={redeploy == null ? "Deploy Template" : "Edit & Redeploy Template"}
     >
-      <TemplateDeployer
+      <TemplateDeployer.Root
         busy={
           deploying || currentProject.isLoading || templateCatalog.isLoading
         }
-        deployLabel={redeploy == null ? undefined : "Redeploy"}
         errorMessage={templateCatalog.error?.message}
         initialSettings={initialSettings}
         loading={templateCatalog.isLoading}
@@ -144,7 +143,15 @@ export function TemplateDeploymentPane({
           });
         }}
         templateOptions={templateCatalog.templates}
-      />
+      >
+        <TemplateDeployer.Fields />
+        <SidePaneFooter>
+          <TemplateDeployer.Submit
+            className="w-full"
+            label={redeploy == null ? undefined : "Redeploy"}
+          />
+        </SidePaneFooter>
+      </TemplateDeployer.Root>
       {overwriteGate.dialog}
     </SidePane>
   );

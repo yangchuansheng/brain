@@ -36,6 +36,10 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { useSWRConfig } from "swr";
+import {
+  claimBrainAiEngagementFromSession,
+  trackBrainGtmEvent,
+} from "@/features/analytics/brain-gtm";
 import { Chat } from "@/features/chat/chat";
 import type { ChatHeaderThreadHistory } from "@/features/chat/chat.types";
 import { FreeTurnsIndicator } from "@/features/chat/free-turns-indicator";
@@ -107,7 +111,12 @@ import {
   type ProjectEditDialogValues,
 } from "@/features/projects/project-edit-dialog";
 import { isAssistantChatNamespaceReady } from "@/features/shell/project-assistant-chat-readiness";
-import { kubeconfigAtom, namespaceAtom } from "@/lib/auth-store";
+import {
+  ProjectTopBarSlotHost,
+  ProjectTopBarSlotProvider,
+} from "@/features/shell/project-top-bar-slot";
+import { appTokenRequestHeaders } from "@/lib/app-token-header";
+import { appTokenAtom, kubeconfigAtom, namespaceAtom } from "@/lib/auth-store";
 import { kubeconfigBearerHeader } from "@/lib/kubeconfig-header";
 import { errorDescription, toastErrorDetail } from "@/lib/toast-utils";
 import { useEnterMotionFrames } from "@/lib/use-enter-motion-frames";
@@ -392,6 +401,7 @@ function ProjectAssistantChatSession({
   const router = useRouter();
   const projectSurfaceRouter = useProjectSidePaneAssistantRouter();
   const { mutate: revalidateScopeSwr } = useSWRConfig();
+  const appToken = useAtomValue(appTokenAtom);
   const kubeconfig = useAtomValue(kubeconfigAtom);
   const namespace = useAtomValue(namespaceAtom);
   const chatId = bootstrap.chatId;
@@ -460,10 +470,16 @@ function ProjectAssistantChatSession({
             wire.projectId
           );
 
+          const headersWithAppToken = new Headers(headers);
+          for (const [name, value] of Object.entries(
+            appTokenRequestHeaders(appToken)
+          )) {
+            headersWithAppToken.set(name, value);
+          }
           return {
             api,
             credentials,
-            headers,
+            headers: headersWithAppToken,
             body: {
               ...(body && typeof body === "object" ? body : {}),
               ...(assistantContext == null ? {} : { assistantContext }),
@@ -475,7 +491,7 @@ function ProjectAssistantChatSession({
           };
         },
       }),
-    [currentProject.displayName, kubeconfig, transportToken]
+    [appToken, currentProject.displayName, kubeconfig, transportToken]
   );
 
   const {
@@ -648,6 +664,13 @@ function ProjectAssistantChatSession({
 
   const submitComposerText = useCallback(
     (text: string, selected: ProjectCanvasSelection | null) => {
+      if (claimBrainAiEngagementFromSession(projectId)) {
+        trackBrainGtmEvent({
+          event: "module_view",
+          project_id: projectId,
+          view_name: "ai_chat_engaged",
+        });
+      }
       const snapshot = buildSelectedResourceSnapshot(selected);
       if (snapshot == null) {
         sendMessage({ text }).catch(() => undefined);
@@ -661,7 +684,7 @@ function ProjectAssistantChatSession({
         ],
       }).catch(() => undefined);
     },
-    [sendMessage]
+    [projectId, sendMessage]
   );
 
   const stopComposerResponse = useCallback(() => {
@@ -713,6 +736,7 @@ function ProjectAssistantChatSession({
 
 function ProjectAssistantChatPane() {
   const namespaceRaw = useAtomValue(namespaceAtom);
+  const appToken = useAtomValue(appTokenAtom);
   const kubeconfig = useAtomValue(kubeconfigAtom);
   const namespaceReady = isAssistantChatNamespaceReady(namespaceRaw);
   const sidePaneRouter = useProjectSidePaneAssistantRouter();
@@ -722,7 +746,7 @@ function ProjectAssistantChatPane() {
   const assistantStateRefreshSequenceRef = useRef(0);
   const prevBillingRef = useRef<"free" | "user" | null>(null);
 
-  const sessionResetKey = `${kubeconfig}\u0000${namespaceRaw}\u0000${namespaceReady}`;
+  const sessionResetKey = `${kubeconfig}\u0000${appToken}\u0000${namespaceRaw}\u0000${namespaceReady}`;
   const [prevSessionResetKey, setPrevSessionResetKey] =
     useState(sessionResetKey);
   if (prevSessionResetKey !== sessionResetKey) {
@@ -741,7 +765,11 @@ function ProjectAssistantChatPane() {
       return;
     }
 
-    fetchAssistantSession(namespaceRaw, kubeconfig).then((payload) => {
+    fetchAssistantSession({
+      appToken,
+      kubeconfig,
+      namespace: namespaceRaw,
+    }).then((payload) => {
       if (cancelled) {
         return;
       }
@@ -758,7 +786,7 @@ function ProjectAssistantChatPane() {
       cancelled = true;
       assistantStateRefreshSequenceRef.current += 1;
     };
-  }, [kubeconfig, namespaceRaw, namespaceReady]);
+  }, [appToken, kubeconfig, namespaceRaw, namespaceReady]);
 
   const handleBillingHeaders = useCallback((headers: Headers) => {
     const billingHeader = headers.get("X-Chat-Billing");
@@ -791,11 +819,11 @@ function ProjectAssistantChatPane() {
       if (threadId === session?.chatId) {
         return;
       }
-      const messages = await fetchAssistantThreadMessages(
-        threadId,
-        namespaceRaw,
-        kubeconfig
-      );
+      const messages = await fetchAssistantThreadMessages(threadId, {
+        appToken,
+        kubeconfig,
+        namespace: namespaceRaw,
+      });
       if (messages == null) {
         return;
       }
@@ -803,7 +831,7 @@ function ProjectAssistantChatPane() {
         prev == null ? prev : { ...prev, chatId: threadId, messages }
       );
     },
-    [kubeconfig, namespaceRaw, session?.chatId]
+    [appToken, kubeconfig, namespaceRaw, session?.chatId]
   );
 
   // The verified actor is bound when the first message materializes this draft.
@@ -828,7 +856,11 @@ function ProjectAssistantChatPane() {
   const refreshAssistantState = useCallback(async () => {
     const sequence = assistantStateRefreshSequenceRef.current + 1;
     assistantStateRefreshSequenceRef.current = sequence;
-    const refreshed = await fetchAssistantSession(namespaceRaw, kubeconfig);
+    const refreshed = await fetchAssistantSession({
+      appToken,
+      kubeconfig,
+      namespace: namespaceRaw,
+    });
     if (
       refreshed == null ||
       sequence !== assistantStateRefreshSequenceRef.current
@@ -848,7 +880,7 @@ function ProjectAssistantChatPane() {
       });
     }
     prevBillingRef.current = refreshed.freeTier.billing;
-  }, [kubeconfig, namespaceRaw]);
+  }, [appToken, kubeconfig, namespaceRaw]);
 
   const openGithubIntent = useCallback(() => {
     sidePaneRouter
@@ -982,7 +1014,11 @@ function ProjectRouteTopBar({
           !assistantPaneOpen && "pr-12"
         )}
       >
-        <div className="pointer-events-auto flex min-w-0 shrink-0 basis-40 items-center">
+        {/* Content-hugging with a cap: the name keeps priority over the dock
+            up to the cap, then truncates; the dock flows right after it. The
+            cap tightens on mobile so the dock's chip and overflow trigger
+            always keep room. */}
+        <div className="pointer-events-auto flex min-w-0 max-w-40 shrink-0 items-center sm:max-w-64">
           {showProjectName ? (
             <div className="flex min-w-0 items-center gap-1 rounded-lg bg-background/10 backdrop-blur-lg">
               {currentProject.isLoading ? (
@@ -991,7 +1027,7 @@ function ProjectRouteTopBar({
                 <>
                   <button
                     aria-label={`Edit project name: ${projectName}`}
-                    className="flex min-w-0 shrink-0 cursor-pointer items-center gap-[6px] overflow-hidden rounded-md p-2 text-left transition-colors hover:bg-input/30 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+                    className="flex min-w-0 cursor-pointer items-center gap-[6px] overflow-hidden rounded-md p-2 text-left transition-colors hover:bg-input/30 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
                     onClick={() => setEditOpen(true)}
                     type="button"
                   >
@@ -1014,6 +1050,10 @@ function ProjectRouteTopBar({
             </div>
           ) : null}
         </div>
+        {/* Rented to page modules (Deployment Task Dock); slot content
+            centers in the bar, and overflow opens as a popover panel, so
+            the row keeps its fixed height. */}
+        <ProjectTopBarSlotHost className="flex min-w-0 flex-1 items-center" />
       </header>
       <ProjectEditDialog
         currentDescription={projectDescription}
@@ -1426,9 +1466,11 @@ export default function ProjectWorkspaceLayout({
   return (
     <ProjectSidePaneProvider>
       <ProjectIdProvider>
-        <ProjectWorkspaceLayoutContent>
-          {children}
-        </ProjectWorkspaceLayoutContent>
+        <ProjectTopBarSlotProvider>
+          <ProjectWorkspaceLayoutContent>
+            {children}
+          </ProjectWorkspaceLayoutContent>
+        </ProjectTopBarSlotProvider>
       </ProjectIdProvider>
     </ProjectSidePaneProvider>
   );

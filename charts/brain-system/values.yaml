@@ -56,10 +56,9 @@ api:
     AP_USER_DOMAIN_TLS_SECRET_NAME: ""
     VMSELECT_URL: "http://vmselect-vm-stack-victoria-metrics-k8s-stack.vm.svc:8481/select/0/prometheus"
     VLSELECT_URL: "http://usr-vlc-victoria-logs-cluster-vlselect.vlc.svc:9471/select/logsql/query"
+    # Process-level credentials; changing them requires an API rollout.
     VLSELECT_USERNAME: ""
     VLSELECT_PASSWORD: ""
-    VMAUTH_SECRET_NAMESPACE: ""
-    VMAUTH_SECRET_NAME: ""
     DATABASE_URL: ""
     DB_PUBLIC_HOST: ""
     WHODB_URL: ""
@@ -113,7 +112,11 @@ ui:
     AP_USER_DOMAIN_TLS_SECRET_NAME: ""
     API_URL: ""
     NEXT_PUBLIC_APP_URL: ""
+    GTM_ID: ""
     DATABASE_URL: ""
+    JWT_INTERNAL: ""
+    MARKETING_EVENTS_INGEST_SECRET: ""
+    MARKETING_CONSENT_SIGNING_KEY: ""
     GITHUB_APP_ID: ""
     GITHUB_APP_PRIVATE_KEY: ""
     GITHUB_OAUTH_CLIENT_ID: ""
@@ -128,9 +131,15 @@ ui:
     DEVBOX_TOKEN: ""
     DEVBOX_JWT_SIGNING_KEY: ""
     DEVBOX_RUNTIME_IMAGE: ""
-    DEVBOX_ARCHIVE_AFTER_PAUSE_TIME: "24h"
     DEVBOX_JWT_TTL_SECONDS: "14400"
     DEPLOY_DEVBOX_STORAGE_LIMIT: "10Gi"
+    # Devbox-reachable Brain MCP endpoint. Leave empty to default to the UI
+    # public URL + /api/deploy-agent/mcp/v1; set explicitly when the UI is
+    # not publicly reachable from deployment Devboxes.
+    DEPLOY_AGENT_MCP_URL: ""
+    # Optional. Leave empty to use sealos-skills.git#main. Set this to a
+    # branch, tag, or commit ref when selecting another tested Skill source.
+    DEPLOY_SKILL_SOURCE: ""
   resources:
     requests:
       cpu: 500m

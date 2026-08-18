@@ -12,6 +12,16 @@ export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") {
     return;
   }
+  const { appTokenVerificationConfigFromEnv, assertProductionAppTokenConfig } =
+    await import("@/lib/app-token");
+  // ADR-0059: personal-resource authorization must never fall back to a
+  // default secret, so a production boot without the config aborts here.
+  assertProductionAppTokenConfig();
+  if (appTokenVerificationConfigFromEnv() == null) {
+    console.warn(
+      "[instrumentation] JWT_INTERNAL is unset; personal-resource routes will fail closed with 401."
+    );
+  }
   const { runAppPostgresMigrations } = await import(
     "@/lib/app-postgres/migrate"
   );
@@ -41,6 +51,20 @@ export async function register() {
     }
     console.warn(
       "[instrumentation] deploy task engine failed to start:",
+      error
+    );
+  }
+  try {
+    const { startChatDevboxLifecycleRuntime } = await import(
+      "@/features/chat/devbox/lifecycle"
+    );
+    startChatDevboxLifecycleRuntime();
+  } catch (error) {
+    if (process.env.NODE_ENV === "production") {
+      throw error;
+    }
+    console.warn(
+      "[instrumentation] chat Devbox lifecycle failed to start:",
       error
     );
   }

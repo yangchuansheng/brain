@@ -1,5 +1,5 @@
+import { GoogleTagManager } from "@next/third-parties/google";
 import { Geist, JetBrains_Mono } from "next/font/google";
-
 import { NuqsAdapter } from "nuqs/adapters/next/app";
 import { Suspense } from "react";
 
@@ -9,8 +9,11 @@ import { ThemeProvider } from "@workspace/ui/components/theme-provider";
 import { TooltipProvider } from "@workspace/ui/components/tooltip";
 import { cn } from "@workspace/ui/lib/utils";
 import { DevTweaks } from "@/features/dev-tweaks/dev-tweaks";
-import { StatusHeartbeatTweaks } from "@/features/dev-tweaks/status-heartbeat-tweaks";
 import { JotaiProvider } from "@/features/shell/jotai-provider";
+
+// GTM_ID is injected by the deployment environment and must not be baked into
+// a statically generated layout.
+export const dynamic = "force-dynamic";
 
 const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
 
@@ -19,21 +22,7 @@ const fontMono = JetBrains_Mono({
   variable: "--font-mono",
 });
 
-const reactScanEnabled =
-  process.env.NODE_ENV === "development" && process.env.REACT_SCAN === "true";
-
-const reactScanOptionsScript = `
-window.reactScan?.({
-  allowInIframe: true,
-  animationSpeed: "slow",
-  enabled: true,
-  safeArea: { bottom: 80, right: 24 },
-  showFPS: true,
-  showNotificationCount: true,
-  showToolbar: true,
-  trackUnnecessaryRenders: true,
-});
-`;
+const gtmId = process.env.GTM_ID?.trim() ?? "";
 
 export default function RootLayout({
   children,
@@ -43,7 +32,7 @@ export default function RootLayout({
   return (
     <html
       className={cn(
-        "antialiased",
+        "h-full antialiased",
         fontMono.variable,
         "font-sans",
         geist.variable
@@ -51,29 +40,22 @@ export default function RootLayout({
       lang="en"
       suppressHydrationWarning
     >
-      <head>
-        {reactScanEnabled ? (
-          <>
-            <script src="https://unpkg.com/react-scan/dist/auto.global.js" />
-            <script>{reactScanOptionsScript}</script>
-          </>
-        ) : null}
-      </head>
-      <body>
+      <body className="h-full">
         <JotaiProvider>
           <NuqsAdapter>
             <ThemeProvider>
               <TooltipProvider>
                 <Toaster />
-                {/* Outside the children Suspense so it works while the app
-                    content is still streaming or blocked on data. */}
-                <DevTweaks />
-                <StatusHeartbeatTweaks />
-                <Suspense fallback={null}>{children}</Suspense>
+                {/* DevTweaks wraps the app so frame mode can dock the page
+                    into an inset card. */}
+                <DevTweaks>
+                  <Suspense fallback={null}>{children}</Suspense>
+                </DevTweaks>
               </TooltipProvider>
             </ThemeProvider>
           </NuqsAdapter>
         </JotaiProvider>
+        {gtmId === "" ? null : <GoogleTagManager gtmId={gtmId} />}
       </body>
     </html>
   );

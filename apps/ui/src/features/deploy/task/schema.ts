@@ -2,6 +2,7 @@ import type { UIMessage } from "ai";
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  check,
   index,
   jsonb,
   pgSchema,
@@ -15,6 +16,7 @@ import type {
   TemplateDefaultValue,
   TemplateSourceInput,
 } from "@/features/deploy/template-provider-core";
+import type { MarketingAttributionSnapshot } from "@/features/marketing/types";
 import type { DeploymentTaskTimelineSnapshot } from "./timeline";
 
 export const DEPLOYMENT_TASK_DB_SCHEMA = "sealai_deployment";
@@ -29,6 +31,16 @@ export type DeployTaskStatus =
   | "completed"
   | "failed"
   | "cancelled";
+
+export type DeployTaskAgentProtocol = "mcp-v1";
+export type DeployTaskAgentCallState =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed";
+export type DeployTaskAgentToolName = "template_ready" | "deployment_completed";
+
+export type DeployTaskAgentCallResponse = Record<string, unknown>;
 
 export type DeployTaskPhase =
   | "queued"
@@ -94,12 +106,23 @@ export interface DeploymentTaskDeploymentPlanInput extends TemplateSourceInput {
   sensitive?: boolean;
 }
 
+/**
+ * Public header-only render values for an AI-generated Sealos Template. Raw
+ * source remains in outputJson; submitted Blocking Input values are excluded.
+ */
+export interface DeploymentTaskTemplateRenderState {
+  defaults: Record<string, string>;
+  inputs: TemplateSourceInput[];
+}
+
 export interface DeploymentTaskDeploymentPlan {
   args?: Record<string, string>;
   defaults?: Record<string, TemplateDefaultValue>;
   inputs: DeploymentTaskDeploymentPlanInput[];
+  instanceName?: string;
   kind: "sealos-template";
   missingInputKeys?: string[];
+  renderState?: DeploymentTaskTemplateRenderState;
   templateName: string;
 }
 
@@ -166,6 +189,7 @@ export type DeployTaskFailureReason =
   | "gateway-upstream-error"
   | "gateway-timeout"
   | "deployment-output-missing"
+  | "template-output-invalid"
   | "apply-failed"
   | "quota-exceeded"
   | "readiness-timeout"
@@ -234,7 +258,12 @@ export type DeploymentTaskSource =
 export type DeploymentTaskTarget =
   | {
       description?: string;
-      displayName: string;
+      /**
+       * Omit to let the server derive the name from the Deployment Source and
+       * resolve collisions with a suffix; supply one to have it used verbatim,
+       * with a collision reported as a conflict rather than renamed (ADR 0058).
+       */
+      displayName?: string;
       kind: "newProject";
     }
   | {
@@ -266,6 +295,9 @@ export const deployTasks = ns.table(
     projectId: text("project_uid"),
     projectName: text("project_name"),
     creatingActor: text("creating_actor"),
+    marketingAttribution: jsonb(
+      "marketing_attribution"
+    ).$type<MarketingAttributionSnapshot | null>(),
     credentialBinding: jsonb(
       "credential_binding"
     ).$type<DeploymentCredentialBinding | null>(),
@@ -286,6 +318,18 @@ export const deployTasks = ns.table(
     runtimeProvider: text("runtime_provider"),
     runtimeName: text("runtime_name"),
     runtimeState: text("runtime_state"),
+    runtimePausedAt: timestamp("runtime_paused_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+    runtimeCleanupLeaseOwner: text("runtime_cleanup_lease_owner"),
+    runtimeCleanupLeaseExpiresAt: timestamp(
+      "runtime_cleanup_lease_expires_at",
+      {
+        mode: "date",
+        withTimezone: true,
+      }
+    ),
     gatewayUrl: text("gateway_url"),
     gatewaySessionId: text("gateway_session_id"),
     gatewayThreadId: text("gateway_thread_id"),
@@ -293,6 +337,27 @@ export const deployTasks = ns.table(
     gatewayStateSnapshot: jsonb(
       "gateway_state_snapshot"
     ).$type<DeployTaskGatewayStateSnapshot | null>(),
+    agentTurnCount: bigint("agent_turn_count", { mode: "number" })
+      .notNull()
+      .default(0),
+    agentProtocol: text("agent_protocol")
+      .notNull()
+      .$type<DeployTaskAgentProtocol>()
+      .default("mcp-v1"),
+    agentControlTokenHash: text("agent_control_token_hash"),
+    agentControlTokenRevokedAt: timestamp("agent_control_token_revoked_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+    agentTemplateDigest: text("agent_template_digest"),
+    agentInputSchemaDigest: text("agent_input_schema_digest"),
+    agentCheckpointId: text("agent_checkpoint_id"),
+    agentInputRevision: bigint("agent_input_revision", { mode: "number" })
+      .notNull()
+      .default(0),
+    agentCompletionReceipt: jsonb(
+      "agent_completion_receipt"
+    ).$type<DeployTaskAgentCallResponse | null>(),
     failureDetails: jsonb(
       "failure_details"
     ).$type<DeployTaskFailureDetails | null>(),
@@ -342,6 +407,25 @@ export const deployTasks = ns.table(
       .notNull(),
   },
   (table) => [
+    check(
+      "deploy_tasks_agent_turn_count_nonnegative",
+      sql`${table.agentTurnCount} >= 0`
+    ),
+    check(
+      "deploy_tasks_agent_input_revision_nonnegative",
+      sql`${table.agentInputRevision} >= 0`
+    ),
+    check(
+      "deploy_tasks_agent_protocol_valid",
+      sql`${table.agentProtocol} IN ('mcp-v1')`
+    ),
+    check(
+      "deploy_tasks_agent_control_token_hash_valid",
+      sql`${table.agentControlTokenHash} IS NULL OR char_length(${table.agentControlTokenHash}) = 64`
+    ),
+    uniqueIndex("deploy_tasks_agent_control_token_hash_idx")
+      .on(table.agentControlTokenHash)
+      .where(sql`${table.agentControlTokenHash} IS NOT NULL`),
     index("deploy_tasks_namespace_updated_at_idx").on(
       table.namespace,
       table.updatedAt
@@ -355,7 +439,7 @@ export const deployTasks = ns.table(
       table.updatedAt
     ),
     // Reaper scans (ADR 0037): leased statuses by lease expiry, queued by
-    // age, terminal by completion time.
+    // age, terminal by completion time, and paused runtimes by deletion due.
     index("deploy_tasks_leased_expiry_idx")
       .on(table.leaseExpiresAt)
       .where(sql`${table.status} IN ('running', 'applying')`),
@@ -365,6 +449,11 @@ export const deployTasks = ns.table(
     index("deploy_tasks_terminal_completed_idx")
       .on(table.completedAt)
       .where(sql`${table.status} IN ('completed', 'failed', 'cancelled')`),
+    index("deploy_tasks_runtime_paused_idx")
+      .on(table.runtimePausedAt)
+      .where(
+        sql`${table.runtimeProvider} = 'devbox' AND lower(coalesce(${table.runtimeState}, '')) IN ('paused', 'archived')`
+      ),
     // One active clone per predecessor (ADR 0038): a concurrent redeploy
     // loses this insert and surfaces as a conflict. Keyed by namespace so a
     // stray cross-namespace row (predecessor lookups are namespace-scoped,
@@ -443,6 +532,68 @@ export const deployTaskMessages = ns.table(
   ]
 );
 
+export const deployTaskAgentCalls = ns.table(
+  "deploy_task_agent_calls",
+  {
+    taskId: text("task_id")
+      .notNull()
+      .references(() => deployTasks.id, { onDelete: "cascade" }),
+    callId: text("call_id").notNull(),
+    leaseEpoch: bigint("lease_epoch", { mode: "number" }).notNull(),
+    toolName: text("tool_name").notNull().$type<DeployTaskAgentToolName>(),
+    request: jsonb("request").notNull().$type<Record<string, unknown>>(),
+    requestHash: text("request_hash").notNull(),
+    state: text("state")
+      .notNull()
+      .$type<DeployTaskAgentCallState>()
+      .default("pending"),
+    claimOwner: text("claim_owner"),
+    claimExpiresAt: timestamp("claim_expires_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+    attempt: bigint("attempt", { mode: "number" }).notNull().default(0),
+    response: jsonb("response").$type<DeployTaskAgentCallResponse | null>(),
+    errorCode: text("error_code"),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { mode: "date", withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    completedAt: timestamp("completed_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.taskId, table.callId],
+      name: "deploy_task_agent_calls_pk",
+    }),
+    index("deploy_task_agent_calls_pending_idx")
+      .on(table.taskId, table.createdAt)
+      .where(sql`${table.state} = 'pending'`),
+    check(
+      "deploy_task_agent_calls_lease_epoch_nonnegative",
+      sql`${table.leaseEpoch} >= 0`
+    ),
+    check(
+      "deploy_task_agent_calls_tool_name_valid",
+      sql`${table.toolName} IN ('template_ready', 'deployment_completed')`
+    ),
+    check(
+      "deploy_task_agent_calls_state_valid",
+      sql`${table.state} IN ('pending', 'running', 'succeeded', 'failed')`
+    ),
+    check(
+      "deploy_task_agent_calls_request_hash_valid",
+      sql`char_length(${table.requestHash}) = 64`
+    ),
+  ]
+);
+
 export type DeployTaskRow = typeof deployTasks.$inferSelect;
 export type DeployTaskEventRow = typeof deployTaskEvents.$inferSelect;
 export type DeployTaskMessageRow = typeof deployTaskMessages.$inferSelect;
+export type DeployTaskAgentCallRow = typeof deployTaskAgentCalls.$inferSelect;

@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { after, afterEach, before, test } from "node:test";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
+
+import { identityFingerprints } from "@/features/chat/persistence/schema";
+import {
+  marketingAttributionSubjects,
+  marketingLifecycleEvents,
+} from "@/features/marketing/schema";
+import { IdentityBindingSupersededError } from "@/lib/identity-fingerprint-core";
 
 import { deploymentFailureMessage } from "../failure-summary";
 import {
@@ -23,9 +30,17 @@ import type {
   DeployTaskEngineContext,
   DeployTaskEngineDevbox,
 } from "./context";
-import { DeployTaskRunCancelledError } from "./errors";
+import {
+  DeployTaskRunCancelledError,
+  DeployTaskRunSupersededError,
+  DeployTaskRunTimeoutError,
+} from "./errors";
+import { createDeployTaskHandle } from "./handle";
 import { runDeployTaskReaperSweep } from "./reaper";
-import { stopDeployTaskEngineRuntimeForTests } from "./runtime";
+import {
+  getActiveDeployTaskHandle,
+  stopDeployTaskEngineRuntimeForTests,
+} from "./runtime";
 import { insertTaskRow } from "./testing/fixtures";
 import {
   createDeployTaskTestHarness,
@@ -33,6 +48,7 @@ import {
 } from "./testing/harness";
 import {
   appendDeployTaskEvent,
+  recordDeployTaskCancelRequest,
   renewDeployTaskLease,
   transitionDeployTask,
 } from "./transitions";
@@ -171,6 +187,27 @@ test("transitions reject illegal moves and stale statuses", async () => {
   assert.equal((await taskById(row.id)).status, "completed");
 });
 
+test("terminal transitions revoke an active Agent control capability", async () => {
+  const ctx = testCtx();
+  const row = await insertTaskRow(harness.db, {
+    agentControlTokenHash: "a".repeat(64),
+    leaseEpoch: 1,
+    leaseOwner: "test-proc",
+    status: "running",
+  });
+
+  const failed = await transitionDeployTask(ctx, {
+    expectedLeaseEpoch: 1,
+    from: ["running"],
+    set: { error: "test failure" },
+    taskId: row.id,
+    to: "failed",
+  });
+
+  assert.ok(failed);
+  assert.ok((await taskById(row.id)).agentControlTokenRevokedAt != null);
+});
+
 test("the status writer rejects blocked transitions without inputs", async () => {
   const ctx = testCtx();
   const row = await insertTaskRow(harness.db, {
@@ -220,6 +257,45 @@ test("stale lease epoch fences writes to no-ops", async () => {
   assert.equal(fencedEvent, null);
   assert.equal((await eventsFor(row.id)).length, 0);
   assert.equal((await taskById(row.id)).status, "running");
+});
+
+test("agent execution counters default safely and use fenced state writes", async () => {
+  const ctx = testCtx();
+  const row = await insertTaskRow(harness.db, {
+    leaseEpoch: 2,
+    leaseOwner: "test-proc",
+    runner: { kind: "ai", runtimeProvider: "devbox" },
+    status: "running",
+  });
+
+  assert.equal(row.agentTurnCount, 0);
+  assert.equal(row.agentProtocol, "mcp-v1");
+
+  const active = createDeployTaskHandle(ctx, {
+    controller: new AbortController(),
+    leaseEpoch: 2,
+    namespace: row.namespace,
+    taskId: row.id,
+  });
+  await active.setState({
+    agentTurnCount: 2,
+  });
+
+  const stored = await taskById(row.id);
+  assert.equal(stored.agentTurnCount, 2);
+  assert.equal(stored.agentProtocol, "mcp-v1");
+
+  const stale = createDeployTaskHandle(ctx, {
+    controller: new AbortController(),
+    leaseEpoch: 1,
+    namespace: row.namespace,
+    taskId: row.id,
+  });
+  await assert.rejects(
+    stale.setState({ agentTurnCount: 3 }),
+    DeployTaskRunSupersededError
+  );
+  assert.equal((await taskById(row.id)).agentTurnCount, 2);
 });
 
 test("lease renewal is fenced by epoch, owner, and status", async () => {
@@ -320,9 +396,9 @@ test("reaper enforces cancel-ack deadline, max active run, and start deadline", 
     status: "running",
   });
   const overrun = await insertTaskRow(harness.db, {
-    leaseClaimedAt: new Date(now - 31 * 60_000),
+    leaseClaimedAt: new Date(now - 71 * 60_000),
     leaseEpoch: 1,
-    leaseExpiresAt: liveLease,
+    leaseExpiresAt: new Date(now - 1000),
     leaseOwner: "live-proc",
     status: "applying",
   });
@@ -362,7 +438,7 @@ test("reaper enforces cancel-ack deadline, max active run, and start deadline", 
   assert.equal(starved, null);
 });
 
-test("reaper fails legacy blocked tasks without inputs and preserves valid waits", async () => {
+test("reaper fails invalid blocked tasks and preserves trusted input waits", async () => {
   const ctx = testCtx();
   const unknown = await insertTaskRow(harness.db, {
     blockingInputs: [],
@@ -376,11 +452,36 @@ test("reaper fails legacy blocked tasks without inputs and preserves valid waits
   const outputMissing = await insertTaskRow(harness.db, { status: "blocked" });
   const buildRuntime = await insertTaskRow(harness.db, { status: "blocked" });
   const gateway = await insertTaskRow(harness.db, { status: "blocked" });
-  const valid = await insertTaskRow(harness.db, {
+  const legacyAi = await insertTaskRow(harness.db, {
+    blockingInputs: [
+      {
+        id: "internal-port",
+        key: "PORT",
+        label: "Port",
+        required: true,
+        type: "text",
+      },
+    ],
+    phase: "configure",
+    runner: { kind: "ai", runtimeProvider: "devbox" },
+    status: "blocked",
+  });
+  const validTemplate = await insertTaskRow(harness.db, {
     blockingInputs: [
       { id: "port", key: "PORT", label: "Port", required: true, type: "text" },
     ],
     phase: "configure",
+    status: "blocked",
+  });
+  const validAi = await insertTaskRow(harness.db, {
+    artifactSummary: {
+      publicProjectionVersion: CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    },
+    blockingInputs: [
+      { id: "PORT", key: "PORT", label: "Port", required: true, type: "text" },
+    ],
+    phase: "configure",
+    runner: { kind: "ai", runtimeProvider: "devbox" },
     status: "blocked",
   });
 
@@ -398,7 +499,7 @@ test("reaper fails legacy blocked tasks without inputs and preserves valid waits
 
   const summary = await runDeployTaskReaperSweep(ctx);
 
-  assert.equal(summary.invalidBlocked, 4);
+  assert.equal(summary.invalidBlocked, 5);
   assert.equal(summary.devboxPaused, 1);
   const unknownRow = await taskById(unknown.id);
   assert.equal(unknownRow.status, "failed");
@@ -409,7 +510,15 @@ test("reaper fails legacy blocked tasks without inputs and preserves valid waits
     failureMessage: deploymentFailureMessage("unknown"),
     reason: "unknown",
   });
-  assert.equal((await taskById(valid.id)).status, "blocked");
+  assert.equal((await taskById(validTemplate.id)).status, "blocked");
+  assert.equal((await taskById(validAi.id)).status, "blocked");
+  const legacyAiRow = await taskById(legacyAi.id);
+  assert.equal(legacyAiRow.status, "failed");
+  assert.deepEqual(legacyAiRow.failureDetails, {
+    detail: "untrusted-ai-blocking-inputs",
+    failureMessage: deploymentFailureMessage("unknown"),
+    reason: "unknown",
+  });
 
   const [unknownEvent] = await eventsFor(unknown.id);
   assert.equal(unknownEvent?.kind, "deployment_task.engine_resolved");
@@ -475,6 +584,444 @@ test("create action inserts, claims inline, launches, and completes through the 
     "runner.progress",
     "deployment_task.completed",
   ]);
+});
+
+test("deployment transitions persist attribution and enqueue lifecycle events", async () => {
+  const ctx = testCtx();
+  const touch = {
+    campaign: "us-deploy-intent",
+    channel: "paid_search",
+    click_id_type: "gclid" as const,
+    click_id_value: "test-gclid-123",
+    content: "repo-to-url",
+    landing_hostname: "sealos.io",
+    landing_path: "/",
+    medium: "paid",
+    source: "google",
+    term: "deploy github repo",
+    ts: "2026-08-06T08:00:00.000Z",
+  };
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      creatingActor: "marketing-test-user",
+      marketingAttribution: {
+        ad_personalization: "granted",
+        ad_user_data_consent: true,
+        click_id_candidates: [touch],
+        consent_provenance: null,
+        first_touch: touch,
+        gbraid: null,
+        gclid: "test-gclid-123",
+        last_touch: touch,
+        version: 3,
+        wbraid: null,
+      },
+      namespace: "marketing-test-workspace",
+      runner: { kind: "template" },
+      source: { kind: "template", templateName: "marketing-demo" },
+      target: { kind: "existingProject", projectId: "marketing-project" },
+    },
+    run: async (handle) => {
+      await handle.beginApplying();
+      await handle.complete();
+    },
+  });
+
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+  await result.launched?.done;
+
+  const lifecycleEvents = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(eq(marketingLifecycleEvents.deploymentId, result.task.id))
+    .orderBy(marketingLifecycleEvents.occurredAt);
+  assert.deepEqual(
+    lifecycleEvents.map((event) => event.eventName),
+    ["build_started", "deploy_success"]
+  );
+  assert.deepEqual(
+    lifecycleEvents.map((event) => event.userId),
+    [null, null]
+  );
+  assert.equal(lifecycleEvents[0]?.gclid, null);
+  assert.equal(lifecycleEvents[0]?.adUserDataConsent, "unspecified");
+
+  const userSubjects = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "user"),
+        eq(marketingAttributionSubjects.subjectId, "marketing-test-user")
+      )
+    );
+  assert.equal(userSubjects.length, 0);
+  const [workspaceSubject] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "workspace"),
+        eq(marketingAttributionSubjects.subjectId, "marketing-test-workspace")
+      )
+    );
+  assert.equal(workspaceSubject?.subjectId, "marketing-test-workspace");
+
+  await harness.pglite.query(
+    `UPDATE "sealai_deployment"."deploy_tasks"
+     SET "marketing_attribution" = $1::jsonb
+     WHERE "id" = $2`,
+    [
+      JSON.stringify({
+        ad_personalization: "granted",
+        ad_user_data_consent: true,
+        gclid: "legacy-repair-gclid",
+        version: 2,
+      }),
+      result.task.id,
+    ]
+  );
+
+  await harness.pglite.query(
+    'DELETE FROM "sealai_marketing"."lifecycle_events" WHERE "deployment_id" = $1',
+    [result.task.id]
+  );
+  await harness.pglite.query(
+    `DELETE FROM "sealai_marketing"."attribution_subjects"
+     WHERE ("subject_type" = 'user' AND "subject_id" = $1)
+        OR ("subject_type" = 'workspace' AND "subject_id" = $2)`,
+    ["marketing-test-user", "marketing-test-workspace"]
+  );
+  await harness.pglite.query(
+    'SELECT "sealai_marketing"."reconcile_deploy_marketing_attribution"($1)',
+    [100]
+  );
+  const repairedEvents = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(eq(marketingLifecycleEvents.deploymentId, result.task.id));
+  assert.deepEqual(repairedEvents.map((event) => event.eventName).sort(), [
+    "build_started",
+    "deploy_success",
+  ]);
+  assert.deepEqual(
+    repairedEvents.map((event) => event.userId),
+    [null, null]
+  );
+  assert.equal(repairedEvents[0]?.adUserDataConsent, "granted");
+  const [repairedWorkspaceSubject] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "workspace"),
+        eq(marketingAttributionSubjects.subjectId, "marketing-test-workspace")
+      )
+    );
+  assert.equal(repairedWorkspaceSubject?.gclid, "legacy-repair-gclid");
+  assert.equal(
+    (
+      await harness.db
+        .select()
+        .from(marketingAttributionSubjects)
+        .where(
+          and(
+            eq(marketingAttributionSubjects.subjectType, "user"),
+            eq(marketingAttributionSubjects.subjectId, "marketing-test-user")
+          )
+        )
+    ).length,
+    0
+  );
+
+  const trustedProvenance = {
+    issuer: "sealos-desktop",
+    issued_at: "2026-08-06T08:00:00.000Z",
+    jti: "repair-provenance-jti",
+    region: "region-a",
+    source: "desktop_oauth",
+    subject_id: "marketing-test-user",
+  } as const;
+  await harness.pglite.query(
+    `UPDATE "sealai_deployment"."deploy_tasks"
+     SET "marketing_attribution" = $1::jsonb
+     WHERE "id" = $2`,
+    [
+      JSON.stringify({
+        ad_personalization: "granted",
+        ad_user_data_consent: "granted",
+        consent_provenance: trustedProvenance,
+        gclid: "trusted-repair-gclid",
+        version: 3,
+      }),
+      result.task.id,
+    ]
+  );
+  await harness.pglite.query(
+    'DELETE FROM "sealai_marketing"."lifecycle_events" WHERE "deployment_id" = $1',
+    [result.task.id]
+  );
+  await harness.pglite.query(
+    'SELECT "sealai_marketing"."reconcile_deploy_marketing_attribution"($1)',
+    [100]
+  );
+  const trustedEvents = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(eq(marketingLifecycleEvents.deploymentId, result.task.id));
+  assert.deepEqual(
+    trustedEvents.map((event) => event.userId),
+    ["marketing-test-user", "marketing-test-user"]
+  );
+  const [trustedSubject] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "user"),
+        eq(marketingAttributionSubjects.subjectId, "marketing-test-user")
+      )
+    );
+  assert.equal(trustedSubject?.gclid, "trusted-repair-gclid");
+
+  await harness.pglite.query(
+    'SELECT "sealai_marketing"."upsert_attribution_subject"($1, $2, $3::jsonb)',
+    [
+      "user",
+      "marketing-test-user",
+      JSON.stringify({
+        ad_user_data_consent: "granted",
+        consent_provenance: trustedProvenance,
+      }),
+    ]
+  );
+  await harness.pglite.query(
+    'SELECT "sealai_marketing"."upsert_attribution_subject"($1, $2, $3::jsonb)',
+    ["user", "marketing-test-user", JSON.stringify({})]
+  );
+  const [preservedSubject] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(eq(marketingAttributionSubjects.subjectId, "marketing-test-user"));
+  assert.deepEqual(preservedSubject?.consentProvenance, trustedProvenance);
+});
+
+test("deployment inserts and status transitions survive unavailable marketing tables", async () => {
+  const ctx = testCtx();
+  const touch = {
+    campaign: "fail-open-campaign",
+    channel: "paid_search",
+    click_id_type: "gclid" as const,
+    click_id_value: "fail-open-gclid",
+    content: "repo-to-url",
+    landing_hostname: "sealos.io",
+    landing_path: "/",
+    medium: "paid",
+    source: "google",
+    term: "deploy github repo",
+    ts: "2026-08-06T08:00:00.000Z",
+  };
+  await harness.pglite.query(
+    'ALTER TABLE "sealai_marketing"."attribution_subjects" RENAME TO "attribution_subjects_offline"'
+  );
+  await harness.pglite.query(
+    'ALTER TABLE "sealai_marketing"."lifecycle_events" RENAME TO "lifecycle_events_offline"'
+  );
+  let taskId: string | undefined;
+  try {
+    const result = await createDeployTaskAction(ctx, {
+      create: {
+        creatingActor: "fail-open-user",
+        marketingAttribution: {
+          ad_personalization: "granted",
+          ad_user_data_consent: true,
+          click_id_candidates: [touch],
+          consent_provenance: null,
+          first_touch: touch,
+          gbraid: null,
+          gclid: "fail-open-gclid",
+          last_touch: touch,
+          version: 3,
+          wbraid: null,
+        },
+        namespace: "fail-open-workspace",
+        runner: { kind: "template" },
+        source: { kind: "template", templateName: "fail-open-demo" },
+        target: { kind: "existingProject", projectId: "fail-open-project" },
+      },
+      run: async (handle) => {
+        await handle.beginApplying();
+        await handle.complete();
+      },
+    });
+    assert.equal(result.kind, "created");
+    if (result.kind === "created") {
+      taskId = result.task.id;
+      await result.launched?.done;
+    }
+  } finally {
+    await harness.pglite.query(
+      'ALTER TABLE "sealai_marketing"."attribution_subjects_offline" RENAME TO "attribution_subjects"'
+    );
+    await harness.pglite.query(
+      'ALTER TABLE "sealai_marketing"."lifecycle_events_offline" RENAME TO "lifecycle_events"'
+    );
+  }
+  assert.ok(taskId, "task should be created despite marketing failures");
+  const row = await taskById(taskId);
+  assert.equal(row.status, "completed");
+  const skippedEvents = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(eq(marketingLifecycleEvents.deploymentId, taskId));
+  assert.equal(skippedEvents.length, 0);
+});
+
+test("reconciliation repairs dropped events without overwriting revoked consent", async () => {
+  const provenance = {
+    issuer: "sealos-desktop",
+    issued_at: "2026-08-15T00:00:00.000Z",
+    jti: "reconcile-consent-jti",
+    region: "region-a",
+    source: "desktop_oauth" as const,
+    subject_id: "reconcile-consent-uid",
+  };
+  const task = await insertTaskRow(harness.db, {
+    completedAt: new Date(),
+    namespace: "reconcile-consent-ns",
+    status: "completed",
+  });
+  await harness.db
+    .update(deployTasks)
+    .set({
+      marketingAttribution: {
+        ad_personalization: "granted",
+        ad_user_data_consent: "granted",
+        click_id_candidates: [],
+        consent_provenance: provenance,
+        first_touch: null,
+        gbraid: null,
+        gclid: "reconcile-consent-gclid",
+        last_touch: null,
+        version: 3,
+        wbraid: null,
+      },
+    })
+    .where(eq(deployTasks.id, task.id));
+
+  // First run settles every outstanding repair in the shared harness so the
+  // counts below are exact.
+  await harness.pglite.query(
+    'SELECT "sealai_marketing"."reconcile_deploy_marketing_attribution"($1)',
+    [100]
+  );
+  const [subject] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "user"),
+        eq(marketingAttributionSubjects.subjectId, "reconcile-consent-uid")
+      )
+    );
+  assert.equal(subject?.gclid, "reconcile-consent-gclid");
+
+  // The subject revokes consent, then the task's events are dropped again.
+  await harness.pglite.query(
+    `UPDATE "sealai_marketing"."attribution_subjects"
+     SET "ad_user_data_consent" = 'denied', "gclid" = NULL
+     WHERE "subject_type" = 'user' AND "subject_id" = $1`,
+    ["reconcile-consent-uid"]
+  );
+  await harness.pglite.query(
+    'DELETE FROM "sealai_marketing"."lifecycle_events" WHERE "deployment_id" = $1',
+    [task.id]
+  );
+
+  const repair = await harness.pglite.query<{ repaired: number }>(
+    'SELECT "sealai_marketing"."reconcile_deploy_marketing_attribution"($1) AS "repaired"',
+    [100]
+  );
+  assert.equal(repair.rows[0]?.repaired, 1);
+  const repairedEvents = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(eq(marketingLifecycleEvents.deploymentId, task.id));
+  assert.deepEqual(repairedEvents.map((event) => event.eventName).sort(), [
+    "build_started",
+    "deploy_success",
+  ]);
+  // The historical task snapshot must not resurrect the revoked consent.
+  const [preserved] = await harness.db
+    .select()
+    .from(marketingAttributionSubjects)
+    .where(
+      and(
+        eq(marketingAttributionSubjects.subjectType, "user"),
+        eq(marketingAttributionSubjects.subjectId, "reconcile-consent-uid")
+      )
+    );
+  assert.equal(preserved?.adUserDataConsent, "denied");
+  assert.equal(preserved?.gclid, null);
+
+  // Repaired rows leave the scan: limited runs make progress.
+  const settled = await harness.pglite.query<{ repaired: number }>(
+    'SELECT "sealai_marketing"."reconcile_deploy_marketing_attribution"($1) AS "repaired"',
+    [100]
+  );
+  assert.equal(settled.rows[0]?.repaired, 0);
+});
+
+test("payment transaction IDs deduplicate per conversion action", async () => {
+  const payment = {
+    adUserDataConsent: "denied" as const,
+    currency: "USD",
+    deploymentId: null,
+    eventName: "topup_success" as const,
+    firstTouch: null,
+    gbraid: null,
+    gclid: null,
+    lastTouch: null,
+    occurredAt: new Date("2026-08-06T09:00:00.000Z"),
+    transactionId: "payment-deduplication-test",
+    userId: "payment-test-user",
+    value: "20.000000",
+    wbraid: null,
+    workspaceId: "payment-test-workspace",
+  };
+  const first = await harness.db
+    .insert(marketingLifecycleEvents)
+    .values({ ...payment, eventId: "payment-deduplication-event-1" })
+    .onConflictDoNothing()
+    .returning({ eventId: marketingLifecycleEvents.eventId });
+  const duplicate = await harness.db
+    .insert(marketingLifecycleEvents)
+    .values({ ...payment, eventId: "payment-deduplication-event-2" })
+    .onConflictDoNothing()
+    .returning({ eventId: marketingLifecycleEvents.eventId });
+  const otherAction = await harness.db
+    .insert(marketingLifecycleEvents)
+    .values({
+      ...payment,
+      eventId: "payment-deduplication-event-3",
+      eventName: "new_subscription",
+    })
+    .onConflictDoNothing()
+    .returning({ eventId: marketingLifecycleEvents.eventId });
+
+  assert.equal(first.length, 1);
+  assert.equal(duplicate.length, 0);
+  assert.equal(otherAction.length, 1);
+  const rows = await harness.db
+    .select()
+    .from(marketingLifecycleEvents)
+    .where(
+      eq(marketingLifecycleEvents.transactionId, "payment-deduplication-test")
+    );
+  assert.equal(rows.length, 2);
 });
 
 test("AI timeline persistence keeps event identity and dedupe semantics", async () => {
@@ -621,6 +1168,207 @@ test("create strips sensitive template args from every persisted form (ADR 0037)
   });
   assert.ok(!persisted.includes("s3cret-value"));
   assert.ok(!persisted.includes("also-s3cret"));
+});
+
+test("create transaction refuses inherited attribution after the identity binding changes", async () => {
+  const ctx = testCtx();
+  const predecessor = await insertTaskRow(harness.db, {
+    completedAt: new Date(),
+    creatingActor: "transaction-fence-cr",
+    namespace: "transaction-fence-ns",
+    status: "failed",
+  });
+  await harness.db
+    .update(deployTasks)
+    .set({
+      marketingAttribution: {
+        ad_personalization: "granted",
+        ad_user_data_consent: "granted",
+        click_id_candidates: [],
+        consent_provenance: {
+          issuer: "sealos-desktop",
+          issued_at: "2026-08-13T00:00:00.000Z",
+          jti: "transaction-fence-jti",
+          region: "region-a",
+          source: "desktop_oauth",
+          subject_id: "transaction-fence-tombstone",
+        },
+        first_touch: null,
+        gbraid: null,
+        gclid: null,
+        last_touch: null,
+        version: 3,
+        wbraid: null,
+      },
+    })
+    .where(eq(deployTasks.id, predecessor.id));
+  await harness.db.insert(identityFingerprints).values({
+    crName: "transaction-fence-cr",
+    mintedAt: 2,
+    userUid: "transaction-fence-survivor",
+  });
+
+  await assert.rejects(
+    createDeployTaskAction(ctx, {
+      create: {
+        creatingActor: "transaction-fence-cr",
+        marketingConsentSubject: "transaction-fence-tombstone",
+        namespace: "transaction-fence-ns",
+      },
+      predecessorTaskId: predecessor.id,
+      run: async () => {
+        /* a superseded binding never launches */
+      },
+    }),
+    IdentityBindingSupersededError
+  );
+
+  assert.equal(
+    (
+      await harness.db
+        .select()
+        .from(deployTasks)
+        .where(eq(deployTasks.retriedFromTaskId, predecessor.id))
+    ).length,
+    0
+  );
+});
+
+test("collaborative redeploy keeps workspace attribution without predecessor user identity", async () => {
+  const ctx = testCtx();
+  const predecessor = await insertTaskRow(harness.db, {
+    completedAt: new Date(),
+    creatingActor: "collaborative-member-a-cr",
+    namespace: "collaborative-attribution-ns",
+    status: "failed",
+  });
+  const touch = {
+    campaign: "collaborative-campaign",
+    channel: "paid_search" as const,
+    click_id_type: "gclid" as const,
+    click_id_value: "collaborative-gclid",
+    content: "redeploy",
+    landing_hostname: "sealos.io",
+    landing_path: "/",
+    medium: "paid",
+    source: "google",
+    term: "deploy",
+    ts: "2026-08-14T00:00:00.000Z",
+  };
+  await harness.db
+    .update(deployTasks)
+    .set({
+      marketingAttribution: {
+        ad_personalization: "granted",
+        ad_user_data_consent: "granted",
+        click_id_candidates: [touch],
+        consent_provenance: {
+          issuer: "sealos-desktop",
+          issued_at: "2026-08-14T00:00:00.000Z",
+          jti: "collaborative-member-a-jti",
+          region: "region-a",
+          source: "desktop_oauth",
+          subject_id: "collaborative-member-a-uid",
+        },
+        first_touch: touch,
+        gbraid: null,
+        gclid: "collaborative-gclid",
+        last_touch: touch,
+        version: 3,
+        wbraid: null,
+      },
+    })
+    .where(eq(deployTasks.id, predecessor.id));
+
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      creatingActor: "collaborative-member-b-cr",
+      marketingConsentSubject: "collaborative-member-b-uid",
+      namespace: "collaborative-attribution-ns",
+    },
+    predecessorTaskId: predecessor.id,
+    run: async () => {
+      /* the attribution assertion only needs task creation */
+    },
+  });
+
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+  const stored = await taskById(result.task.id);
+  assert.equal(stored.marketingAttribution?.consent_provenance, null);
+  assert.equal(
+    stored.marketingAttribution?.ad_user_data_consent,
+    "unspecified"
+  );
+  assert.equal(stored.marketingAttribution?.gclid, null);
+  assert.equal(
+    stored.marketingAttribution?.first_touch?.campaign,
+    "collaborative-campaign"
+  );
+  assert.equal(stored.marketingAttribution?.first_touch?.click_id_value, "");
+});
+
+test("same-uid redeploy retains the predecessor's verified attribution", async () => {
+  const ctx = testCtx();
+  const predecessor = await insertTaskRow(harness.db, {
+    completedAt: new Date(),
+    creatingActor: "same-uid-member-cr",
+    namespace: "same-uid-attribution-ns",
+    status: "failed",
+  });
+  const provenance = {
+    issuer: "sealos-desktop",
+    issued_at: "2026-08-14T00:00:00.000Z",
+    jti: "same-uid-member-jti",
+    region: "region-a",
+    source: "desktop_oauth" as const,
+    subject_id: "same-uid-member-uid",
+  };
+  await harness.db
+    .update(deployTasks)
+    .set({
+      marketingAttribution: {
+        ad_personalization: "granted",
+        ad_user_data_consent: "granted",
+        click_id_candidates: [],
+        consent_provenance: provenance,
+        first_touch: null,
+        gbraid: null,
+        gclid: "same-uid-gclid",
+        last_touch: null,
+        version: 3,
+        wbraid: null,
+      },
+    })
+    .where(eq(deployTasks.id, predecessor.id));
+  await harness.db.insert(identityFingerprints).values({
+    crName: "same-uid-member-cr",
+    mintedAt: 1,
+    userUid: "same-uid-member-uid",
+  });
+
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      creatingActor: "same-uid-member-cr",
+      marketingConsentSubject: "same-uid-member-uid",
+      namespace: "same-uid-attribution-ns",
+    },
+    predecessorTaskId: predecessor.id,
+    run: async () => {
+      /* the attribution assertion only needs task creation */
+    },
+  });
+
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+  const stored = await taskById(result.task.id);
+  assert.deepEqual(stored.marketingAttribution?.consent_provenance, provenance);
+  assert.equal(stored.marketingAttribution?.ad_user_data_consent, "granted");
+  assert.equal(stored.marketingAttribution?.gclid, "same-uid-gclid");
 });
 
 test("clone validation matrix: not-found, conflict on active/completed, unique race", async () => {
@@ -1006,9 +1754,88 @@ test("input submission claims blocked→running in place and hands values in mem
   assert.equal(conflict.kind, "conflict");
 });
 
+test("a stale blocked run cannot unregister its resumed successor", async () => {
+  const ctx = testCtx();
+  let releaseOldRun!: () => void;
+  let releaseResumedRun!: () => void;
+  let blockedReady!: () => void;
+  let resumedReady!: () => void;
+  const oldRunGate = new Promise<void>((resolve) => {
+    releaseOldRun = resolve;
+  });
+  const resumedRunGate = new Promise<void>((resolve) => {
+    releaseResumedRun = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    blockedReady = resolve;
+  });
+  const resumed = new Promise<void>((resolve) => {
+    resumedReady = resolve;
+  });
+
+  const created = await createDeployTaskAction(ctx, {
+    create: {
+      namespace: "ns-test",
+      runner: { kind: "template" },
+      source: { kind: "template", templateName: "demo" },
+      target: { kind: "existingProject", projectId: "project-test" },
+    },
+    run: async (handle) => {
+      await handle.requestInputs({
+        blockingInputs: [
+          {
+            id: "release-name",
+            label: "Release name",
+            required: true,
+            type: "text",
+          },
+        ],
+      });
+      blockedReady();
+      await oldRunGate;
+    },
+  });
+  assert.equal(created.kind, "created");
+  if (created.kind !== "created") {
+    return;
+  }
+  await blocked;
+
+  const resumedResult = await submitDeployTaskInputAction(ctx, {
+    namespace: "ns-test",
+    run: async (handle) => {
+      resumedReady();
+      await resumedRunGate;
+      await handle.beginApplying();
+      await handle.complete();
+    },
+    taskId: created.task.id,
+    values: { "release-name": "stable" },
+  });
+  assert.equal(resumedResult.kind, "resumed");
+  if (resumedResult.kind !== "resumed") {
+    return;
+  }
+  await resumed;
+
+  releaseOldRun();
+  await created.launched?.done;
+  assert.equal(
+    getActiveDeployTaskHandle(created.task.id),
+    resumedResult.launched.handle
+  );
+
+  releaseResumedRun();
+  await resumedResult.launched.done;
+  assert.equal((await taskById(created.task.id)).status, "completed");
+});
+
 test("partial required input submission stays blocked without launching", async () => {
   const ctx = testCtx();
   const blocked = await insertTaskRow(harness.db, {
+    artifactSummary: {
+      publicProjectionVersion: CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    },
     blockingInputs: [
       {
         id: "PORT",
@@ -1042,7 +1869,7 @@ test("partial required input submission stays blocked without launching", async 
       return Promise.resolve();
     },
     taskId: blocked.id,
-    values: { "configuration-1": "8080" },
+    values: { PORT: "8080" },
   });
 
   assert.equal(result.kind, "invalid-input");
@@ -1065,6 +1892,9 @@ test("partial required input submission stays blocked without launching", async 
 test("one AI public identifier cannot satisfy two required blockers", async () => {
   const ctx = testCtx();
   const blocked = await insertTaskRow(harness.db, {
+    artifactSummary: {
+      publicProjectionVersion: CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    },
     blockingInputs: [
       {
         id: "PORT",
@@ -1106,19 +1936,22 @@ test("one AI public identifier cannot satisfy two required blockers", async () =
   assert.equal((await taskById(blocked.id)).status, "blocked");
 });
 
-test("legacy AI public aliases bind each value to exactly one canonical key", async () => {
+test("trusted AI canonical keys bind each value without aliases", async () => {
   const ctx = testCtx();
   const blocked = await insertTaskRow(harness.db, {
+    artifactSummary: {
+      publicProjectionVersion: CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    },
     blockingInputs: [
       {
-        id: "configuration-2",
-        key: "configuration-2",
+        id: "internal-port-field",
+        key: "PORT",
         label: "Port",
         required: true,
         type: "env",
       },
       {
-        id: "PASSWORD",
+        id: "internal-password-field",
         key: "PASSWORD",
         label: "Password",
         required: true,
@@ -1140,8 +1973,8 @@ test("legacy AI public aliases bind each value to exactly one canonical key", as
     },
     taskId: blocked.id,
     values: {
-      "configuration-1": "8080",
-      "configuration-2": "secret-value",
+      PASSWORD: "secret-value",
+      PORT: "8080",
     },
   });
 
@@ -1151,9 +1984,44 @@ test("legacy AI public aliases bind each value to exactly one canonical key", as
   }
   await result.launched.done;
   assert.deepEqual(received, {
-    "configuration-2": "8080",
     PASSWORD: "secret-value",
+    PORT: "8080",
   });
+});
+
+test("trusted AI submissions reject unpublished internal blocker ids", async () => {
+  const ctx = testCtx();
+  const blocked = await insertTaskRow(harness.db, {
+    artifactSummary: {
+      publicProjectionVersion: CURRENT_AI_ARTIFACT_PUBLIC_PROJECTION_VERSION,
+    },
+    blockingInputs: [
+      {
+        id: "internal-port-field",
+        key: "PORT",
+        label: "Port",
+        required: true,
+        type: "env",
+      },
+    ],
+    runner: { kind: "ai", runtimeProvider: "devbox" },
+    status: "blocked",
+  });
+  let runCalled = false;
+
+  const result = await submitDeployTaskInputAction(ctx, {
+    namespace: "ns-test",
+    run: () => {
+      runCalled = true;
+      return Promise.resolve();
+    },
+    taskId: blocked.id,
+    values: { "internal-port-field": "8080" },
+  });
+
+  assert.equal(result.kind, "invalid-input");
+  assert.equal(runCalled, false);
+  assert.equal((await taskById(blocked.id)).status, "blocked");
 });
 
 test("legacy AI blockers with duplicate canonical keys cannot resume", async () => {
@@ -1199,7 +2067,7 @@ test("legacy AI blockers with duplicate canonical keys cannot resume", async () 
   assert.equal((await taskById(blocked.id)).status, "blocked");
 });
 
-test("legacy AI input aliases map back only inside the resumed runner", async () => {
+test("legacy untrusted AI blocking inputs cannot resume", async () => {
   const ctx = testCtx();
   const legacySecretKey = "abc";
   const blocked = await insertTaskRow(harness.db, {
@@ -1217,50 +2085,27 @@ test("legacy AI input aliases map back only inside the resumed runner", async ()
     runner: { kind: "ai", runtimeProvider: "devbox" },
     status: "blocked",
   });
-  const short = await submitDeployTaskInputAction(ctx, {
-    namespace: "ns-test",
-    run: () => Promise.resolve(),
-    taskId: blocked.id,
-    values: { "configuration-1": "q7" },
-  });
-  assert.equal(short.kind, "invalid-input");
-  assert.equal(
-    short.kind === "invalid-input" && short.message.includes(legacySecretKey),
-    false
-  );
-
-  let received: Record<string, unknown> | null = null;
-  let receivedBlockingInputs: readonly { key?: string }[] = [];
+  let runCalled = false;
   const result = await submitDeployTaskInputAction(ctx, {
     namespace: "ns-test",
-    run: async (handle, _task, currentBlockingInputs, submittedValues) => {
-      received = submittedValues;
-      receivedBlockingInputs = currentBlockingInputs;
-      await handle.beginApplying();
-      await handle.complete();
+    run: () => {
+      runCalled = true;
+      return Promise.resolve();
     },
     taskId: blocked.id,
-    values: { "configuration-1": "submitted-secret" },
+    values: { [legacySecretKey]: "submitted-secret" },
   });
 
-  assert.equal(result.kind, "resumed");
-  if (result.kind !== "resumed") {
-    return;
-  }
-  await result.launched.done;
-  assert.deepEqual(received, { [legacySecretKey]: "submitted-secret" });
-  assert.deepEqual(
-    receivedBlockingInputs.map((input) => input.key),
-    [legacySecretKey]
+  assert.equal(result.kind, "invalid-input");
+  assert.equal(
+    result.kind === "invalid-input" && result.message,
+    "Deployment inputs are unavailable. Redeploy to try again."
   );
-  const inputEvent = (await eventsFor(blocked.id)).find(
-    (event) => event.kind === "deploy_task.input_submitted"
-  );
-  assert.deepEqual(inputEvent?.payload.inputKeys, ["configuration-1"]);
-  assert.equal(JSON.stringify(inputEvent).includes(legacySecretKey), false);
+  assert.equal(runCalled, false);
+  assert.equal((await taskById(blocked.id)).status, "blocked");
 });
 
-test("current AI input aliases restore identifiers outside the public grammar", async () => {
+test("current AI inputs submit canonical identifiers outside the public grammar", async () => {
   const ctx = testCtx();
   const canonicalKey = "_API_KEY";
   const blocked = await insertTaskRow(harness.db, {
@@ -1293,7 +2138,7 @@ test("current AI input aliases restore identifiers outside the public grammar", 
       await handle.complete();
     },
     taskId: blocked.id,
-    values: { "configuration-1": "submitted-secret" },
+    values: { [canonicalKey]: "submitted-secret" },
   });
 
   assert.equal(result.kind, "resumed");
@@ -1305,8 +2150,7 @@ test("current AI input aliases restore identifiers outside the public grammar", 
   const inputEvent = (await eventsFor(blocked.id)).find(
     (event) => event.kind === "deploy_task.input_submitted"
   );
-  assert.deepEqual(inputEvent?.payload.inputKeys, ["configuration-1"]);
-  assert.equal(JSON.stringify(inputEvent).includes(canonicalKey), false);
+  assert.deepEqual(inputEvent?.payload.inputKeys, [canonicalKey]);
 });
 
 test("input action treats a task from another namespace as not found", async () => {
@@ -1386,8 +2230,282 @@ test("launched run acknowledges cancel as a typed outcome, never failure", async
   assert.ok(stored.completedAt != null);
 });
 
-test("reaper pauses devboxes of terminal tasks and purges after retention", async () => {
-  const ctx = testCtx({ retentionMs: 60_000 });
+test("local watchdog resolves a live run at the active execution deadline", async () => {
+  const ctx = testCtx({
+    leaseRenewIntervalMs: 20,
+    maxActiveRunMs: 60,
+  });
+
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      namespace: "ns-test",
+      runner: { kind: "template" },
+      source: { kind: "template", templateName: "demo" },
+      target: { kind: "existingProject", projectId: "project-test" },
+    },
+    run: async (handle) => {
+      await new Promise<void>((_resolve, reject) => {
+        handle.signal.addEventListener(
+          "abort",
+          () => reject(handle.signal.reason),
+          { once: true }
+        );
+      });
+    },
+  });
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+
+  await result.launched?.done;
+  const stored = await taskById(result.task.id);
+  assert.equal(stored.status, "failed");
+  assert.equal(
+    (stored.failureDetails as { reason?: string } | null)?.reason,
+    "timeout"
+  );
+});
+
+test("local watchdog stops the runner before a slow timeout transition completes", async () => {
+  const baseCtx = testCtx({
+    leaseRenewIntervalMs: 10_000,
+    maxActiveRunMs: 100,
+  });
+  let delayExecute = false;
+  let releaseExecute!: () => void;
+  const executeGate = new Promise<void>((resolve) => {
+    releaseExecute = resolve;
+  });
+  const originalExecute = baseCtx.db.execute.bind(baseCtx.db);
+  const delayedExecute = (async (...args: unknown[]) => {
+    if (delayExecute) {
+      await executeGate;
+    }
+    return await originalExecute(...(args as [never]));
+  }) as typeof baseCtx.db.execute;
+  const delayedDb = new Proxy(baseCtx.db, {
+    get(target, property) {
+      if (property === "execute") {
+        return delayedExecute;
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const ctx: DeployTaskEngineContext = {
+    ...baseCtx,
+    db: delayedDb,
+  };
+
+  let observeAbort!: (reason: unknown) => void;
+  const abortObserved = new Promise<unknown>((resolve) => {
+    observeAbort = resolve;
+  });
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      namespace: "ns-test",
+      runner: { kind: "template" },
+      source: { kind: "template", templateName: "demo" },
+      target: { kind: "existingProject", projectId: "project-test" },
+    },
+    run: async (handle) => {
+      await new Promise<void>((_resolve, reject) => {
+        handle.signal.addEventListener(
+          "abort",
+          () => {
+            observeAbort(handle.signal.reason);
+            reject(handle.signal.reason);
+          },
+          { once: true }
+        );
+      });
+    },
+  });
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+
+  delayExecute = true;
+  let abortGuardTimer: ReturnType<typeof setTimeout> | undefined;
+  const abortReason = await Promise.race([
+    abortObserved,
+    new Promise<never>((_resolve, reject) => {
+      abortGuardTimer = setTimeout(
+        () => reject(new Error("watchdog did not abort before transition")),
+        1000
+      );
+    }),
+  ]);
+  clearTimeout(abortGuardTimer);
+  assert.ok(abortReason instanceof DeployTaskRunTimeoutError);
+  assert.equal((await taskById(result.task.id)).status, "running");
+
+  releaseExecute();
+  await result.launched?.done;
+  const stored = await taskById(result.task.id);
+  assert.equal(stored.status, "failed");
+  assert.equal(
+    (stored.failureDetails as { reason?: string } | null)?.reason,
+    "timeout"
+  );
+});
+
+test("local watchdog gives an already-persisted cancel intent precedence", async () => {
+  const ctx = testCtx({
+    leaseRenewIntervalMs: 10_000,
+    maxActiveRunMs: 100,
+  });
+  let abortReason: unknown;
+  const result = await createDeployTaskAction(ctx, {
+    create: {
+      namespace: "ns-test",
+      runner: { kind: "template" },
+      source: { kind: "template", templateName: "demo" },
+      target: { kind: "existingProject", projectId: "project-test" },
+    },
+    run: async (handle) => {
+      await new Promise<void>((_resolve, reject) => {
+        handle.signal.addEventListener(
+          "abort",
+          () => {
+            abortReason = handle.signal.reason;
+            reject(handle.signal.reason);
+          },
+          { once: true }
+        );
+      });
+    },
+  });
+  assert.equal(result.kind, "created");
+  if (result.kind !== "created") {
+    return;
+  }
+
+  const recorded = await recordDeployTaskCancelRequest(ctx, {
+    taskId: result.task.id,
+  });
+  assert.ok(recorded?.cancelRequestedAt != null);
+  await result.launched?.done;
+
+  assert.ok(abortReason instanceof DeployTaskRunTimeoutError);
+  const stored = await taskById(result.task.id);
+  assert.equal(stored.status, "cancelled");
+  assert.equal(
+    (stored.failureDetails as { detail?: string } | null)?.detail,
+    "cancel-requested-at-deadline"
+  );
+});
+
+test("deadline transition CAS defines cancel-versus-timeout boundary priority", async () => {
+  const ctx = testCtx();
+  const cancelFirst = await insertTaskRow(harness.db, {
+    cancelRequestedAt: new Date(),
+    leaseClaimedAt: new Date(),
+    leaseEpoch: 3,
+    leaseExpiresAt: new Date(Date.now() + 60_000),
+    leaseOwner: ctx.processId,
+    status: "running",
+  });
+  const timeoutBlocked = await transitionDeployTask(ctx, {
+    cancelRequest: "absent",
+    expectedLeaseEpoch: 3,
+    from: ["running"],
+    taskId: cancelFirst.id,
+    to: "failed",
+  });
+  assert.equal(timeoutBlocked, null);
+  const cancelled = await transitionDeployTask(ctx, {
+    cancelRequest: "present",
+    expectedLeaseEpoch: 3,
+    from: ["running"],
+    taskId: cancelFirst.id,
+    to: "cancelled",
+  });
+  assert.ok(cancelled != null);
+
+  const timeoutFirst = await insertTaskRow(harness.db, {
+    leaseClaimedAt: new Date(),
+    leaseEpoch: 4,
+    leaseExpiresAt: new Date(Date.now() + 60_000),
+    leaseOwner: ctx.processId,
+    status: "running",
+  });
+  const timedOut = await transitionDeployTask(ctx, {
+    cancelRequest: "absent",
+    expectedLeaseEpoch: 4,
+    from: ["running"],
+    taskId: timeoutFirst.id,
+    to: "failed",
+  });
+  assert.ok(timedOut != null);
+  assert.equal(
+    await recordDeployTaskCancelRequest(ctx, { taskId: timeoutFirst.id }),
+    null
+  );
+
+  const boundary = await insertTaskRow(harness.db, {
+    leaseClaimedAt: new Date(),
+    leaseEpoch: 5,
+    leaseExpiresAt: new Date(Date.now() + 60_000),
+    leaseOwner: ctx.processId,
+    status: "running",
+  });
+  const [boundaryTimeout, boundaryCancel] = await Promise.all([
+    transitionDeployTask(ctx, {
+      cancelRequest: "absent",
+      expectedLeaseEpoch: 5,
+      from: ["running"],
+      taskId: boundary.id,
+      to: "failed",
+    }),
+    recordDeployTaskCancelRequest(ctx, { taskId: boundary.id }),
+  ]);
+  if (boundaryCancel == null) {
+    assert.ok(boundaryTimeout != null);
+    assert.equal((await taskById(boundary.id)).status, "failed");
+  } else {
+    assert.equal(boundaryTimeout, null);
+    assert.ok(
+      await transitionDeployTask(ctx, {
+        cancelRequest: "present",
+        expectedLeaseEpoch: 5,
+        from: ["running"],
+        taskId: boundary.id,
+        to: "cancelled",
+      })
+    );
+    assert.equal((await taskById(boundary.id)).status, "cancelled");
+  }
+});
+
+test("persisted cancel intent wins over completion", async () => {
+  const ctx = testCtx();
+  const row = await insertTaskRow(harness.db, {
+    leaseClaimedAt: new Date(),
+    leaseEpoch: 6,
+    leaseExpiresAt: new Date(Date.now() + 60_000),
+    leaseOwner: ctx.processId,
+    status: "applying",
+  });
+  const handle = createDeployTaskHandle(ctx, {
+    controller: new AbortController(),
+    leaseEpoch: 6,
+    namespace: row.namespace,
+    taskId: row.id,
+  });
+
+  assert.ok(await recordDeployTaskCancelRequest(ctx, { taskId: row.id }));
+  await assert.rejects(handle.complete(), DeployTaskRunSupersededError);
+  assert.equal((await taskById(row.id)).status, "applying");
+
+  await handle.acknowledgeCancel();
+  assert.equal((await taskById(row.id)).status, "cancelled");
+});
+
+test("reaper pauses terminal-task devboxes and deletes only runtimes after retention", async () => {
+  const ctx = testCtx({ devboxDeleteAfterPauseMs: 60_000 });
 
   const failedWithDevbox = await insertTaskRow(harness.db, {
     completedAt: new Date(Date.now() - 1000),
@@ -1396,38 +2514,59 @@ test("reaper pauses devboxes of terminal tasks and purges after retention", asyn
     runtimeState: "Running",
     status: "failed",
   });
-  const purgeDue = await insertTaskRow(harness.db, {
+  const cleanupFailed = await insertTaskRow(harness.db, {
+    completedAt: new Date(Date.now() - 1000),
+    runtimeName: "devbox-secret-cleanup",
+    runtimeProvider: "devbox",
+    runtimeState: "cleanup-failed",
+    status: "failed",
+  });
+  const cleanupPending = await insertTaskRow(harness.db, {
+    completedAt: new Date(Date.now() - 1000),
+    runtimeName: "devbox-input-cleanup-pending",
+    runtimeProvider: "devbox",
+    runtimeState: "input-cleanup-pending",
+    status: "failed",
+  });
+  const cleanupComplete = await insertTaskRow(harness.db, {
+    completedAt: new Date(Date.now() - 1000),
+    runtimeName: "devbox-input-cleanup-complete",
+    runtimeProvider: "devbox",
+    runtimeState: "input-cleanup-complete",
+    status: "completed",
+  });
+  const deleteDue = await insertTaskRow(harness.db, {
     completedAt: new Date(Date.now() - 120_000),
     runtimeName: "devbox-b",
+    runtimePausedAt: new Date(Date.now() - 120_000),
     runtimeProvider: "devbox",
     runtimeState: "paused",
     status: "cancelled",
   });
 
-  const purgeEvents: string[] = [];
-  const unsubscribe = await harness.notify.subscribe((event) => {
-    if (event.kind === "purge") {
-      purgeEvents.push(event.taskId);
-    }
-  });
-
   const summary = await runDeployTaskReaperSweep(ctx);
   assert.ok(summary.devboxPaused >= 1);
-  assert.equal(summary.purged, 1);
+  assert.equal(summary.devboxDeleted, 1);
 
   assert.ok(devbox.paused.includes("ns-test/devbox-a"));
-  assert.equal((await taskById(failedWithDevbox.id)).runtimeState, "paused");
+  const pausedTask = await taskById(failedWithDevbox.id);
+  assert.equal(pausedTask.runtimeState, "paused");
+  assert.ok(pausedTask.runtimePausedAt);
+
+  assert.ok(devbox.deleted.includes("ns-test/devbox-secret-cleanup"));
+  assert.ok(!devbox.paused.includes("ns-test/devbox-secret-cleanup"));
+  assert.equal((await taskById(cleanupFailed.id)).runtimeState, "deleted");
+
+  assert.ok(devbox.deleted.includes("ns-test/devbox-input-cleanup-pending"));
+  assert.ok(!devbox.paused.includes("ns-test/devbox-input-cleanup-pending"));
+  assert.equal((await taskById(cleanupPending.id)).runtimeState, "deleted");
+
+  assert.ok(devbox.paused.includes("ns-test/devbox-input-cleanup-complete"));
+  assert.ok(!devbox.deleted.includes("ns-test/devbox-input-cleanup-complete"));
+  assert.equal((await taskById(cleanupComplete.id)).runtimeState, "paused");
 
   assert.ok(devbox.deleted.includes("ns-test/devbox-b"));
-  const [purgedRow] = await harness.db
-    .select({ id: deployTasks.id })
-    .from(deployTasks)
-    .where(eq(deployTasks.id, purgeDue.id));
-  assert.equal(purgedRow, undefined);
-
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  await unsubscribe();
-  assert.deepEqual(purgeEvents, [purgeDue.id]);
+  assert.equal((await taskById(deleteDue.id)).runtimeState, "deleted");
 });
 
 test("timer renewal keeps a slow integration alive across lease expiry", async () => {
@@ -1464,7 +2603,7 @@ test("timer renewal keeps a slow integration alive across lease expiry", async (
   assert.equal((await taskById(result.task.id)).status, "completed");
 });
 
-test("a redeploy chain keeps the root's identity after the root is purged", async () => {
+test("a redeploy chain keeps the root identity if a predecessor is missing", async () => {
   const ctx = testCtx();
   const root = await insertTaskRow(harness.db, {
     artifactSummary: {
@@ -1485,7 +2624,7 @@ test("a redeploy chain keeps the root's identity after the root is purged", asyn
   if (cloneB.kind !== "created") {
     return;
   }
-  // B fails without ever generating artifacts; the root is purged.
+  // B fails without ever generating artifacts; simulate a legacy missing root.
   await harness.db
     .update(deployTasks)
     .set({ completedAt: new Date(), status: "failed" })
@@ -1511,11 +2650,15 @@ test("a redeploy chain keeps the root's identity after the root is purged", asyn
   assert.equal(stored.source.kind, "template");
 });
 
-test("purge retries on the next sweep when devbox deletion fails", async () => {
-  const ctx = testCtx({ retentionMs: 60_000 });
+test("Devbox deletion retries without deleting task history", async () => {
+  const ctx = testCtx({
+    devboxDeleteAfterPauseMs: 60_000,
+    reaperIntervalMs: 0,
+  });
   const stuck = await insertTaskRow(harness.db, {
     completedAt: new Date(Date.now() - 120_000),
     runtimeName: "devbox-stuck",
+    runtimePausedAt: new Date(Date.now() - 120_000),
     runtimeProvider: "devbox",
     runtimeState: "paused",
     status: "failed",
@@ -1523,14 +2666,51 @@ test("purge retries on the next sweep when devbox deletion fails", async () => {
 
   devbox.failNextDelete = true;
   const first = await runDeployTaskReaperSweep(ctx);
-  assert.equal(first.purgeFailed, 1);
-  assert.ok(await taskById(stuck.id));
+  assert.equal(first.devboxDeleteFailed, 1);
+  assert.equal((await taskById(stuck.id)).runtimeState, "paused");
 
   const second = await runDeployTaskReaperSweep(ctx);
-  assert.equal(second.purged, 1);
-  const [gone] = await harness.db
-    .select({ id: deployTasks.id })
-    .from(deployTasks)
-    .where(eq(deployTasks.id, stuck.id));
-  assert.equal(gone, undefined);
+  assert.equal(second.devboxDeleted, 1);
+  assert.equal((await taskById(stuck.id)).runtimeState, "deleted");
+});
+
+test("concurrent reapers claim one paused Devbox deletion only once", async () => {
+  const ctx = testCtx({ devboxDeleteAfterPauseMs: 60_000 });
+  const due = await insertTaskRow(harness.db, {
+    completedAt: new Date(Date.now() - 120_000),
+    runtimeName: "devbox-claimed-once",
+    runtimePausedAt: new Date(Date.now() - 120_000),
+    runtimeProvider: "devbox",
+    runtimeState: "paused",
+    status: "failed",
+  });
+  let deleteCalls = 0;
+  let releaseDelete!: () => void;
+  let markDeleteStarted!: () => void;
+  const deleteStarted = new Promise<void>((resolve) => {
+    markDeleteStarted = resolve;
+  });
+  const deleteBlocked = new Promise<void>((resolve) => {
+    releaseDelete = resolve;
+  });
+  devbox.deleteDevbox = async (namespace, name) => {
+    deleteCalls += 1;
+    devbox.deleted.push(`${namespace}/${name}`);
+    markDeleteStarted();
+    await deleteBlocked;
+    return "deleted";
+  };
+
+  const first = runDeployTaskReaperSweep(ctx);
+  await deleteStarted;
+  const second = await runDeployTaskReaperSweep(ctx);
+
+  assert.equal(second.devboxDeleted, 0);
+  assert.equal(deleteCalls, 1);
+  releaseDelete();
+  assert.equal((await first).devboxDeleted, 1);
+  const stored = await taskById(due.id);
+  assert.equal(stored.runtimeState, "deleted");
+  assert.equal(stored.runtimeCleanupLeaseOwner, null);
+  assert.equal(stored.runtimeCleanupLeaseExpiresAt, null);
 });

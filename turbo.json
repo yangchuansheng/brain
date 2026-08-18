@@ -14,11 +14,16 @@
     "DATABASE_URL",
     "DEVBOX_API_BASE_URL",
     "DEVBOX_TOKEN",
+    "DEV_APP_TOKEN_USER_UID",
     "DEV_OPENAI_API_BASE_URL",
     "DEV_OPENAI_API_KEY",
     "DEPLOY_DEVBOX_STORAGE_LIMIT",
+    "DEPLOY_AGENT_MCP_ALLOWED_ORIGINS",
+    "DEPLOY_AGENT_MCP_URL",
+    "DEPLOY_SKILL_SOURCE",
     "DIRECT_AP_READINESS_TIMEOUT_MS",
     "FREE_CHAT_TURNS",
+    "GTM_ID",
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_OAUTH_CLIENT_ID",
@@ -29,9 +34,16 @@
     "GLASS_E2E_URL",
     "KUBERNETES_SERVICE_HOST",
     "KUBERNETES_SERVICE_PORT",
+    "KUBECONFIG",
+    "MARKETING_CONSENT_SIGNING_KEY",
+    "MARKETING_EVENTS_INGEST_SECRET",
     "NEXT_DIST_DIR",
+    "NEXT_PUBLIC_DEMO_MOCK",
+    "NEXT_PUBLIC_DEV_TWEAKS",
     "NEXT_RUNTIME",
     "NODE_ENV",
+    "PATH",
+    "PWCLI",
     "SEALOS_CERT_SECRET",
     "SEALOS_CERT_SECRET_NAME",
     "SYSTEM_OPENAI_API_BASE_URL",
@@ -42,7 +54,7 @@
     "build": {
       "dependsOn": ["^build"],
       "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": [".next/**", "!.next/cache/**"]
+      "outputs": [".next/**", "!.next/cache/**", "!.next/dev/**"]
     },
     "lint": {
       "dependsOn": ["^lint"]
@@ -55,7 +67,6 @@
     },
     "dev": {
       "cache": false,
-      "env": ["REACT_SCAN"],
       "persistent": true
     }
   }

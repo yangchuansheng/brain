@@ -1,5 +1,8 @@
 "use client";
 
+import { readMarketingAttribution } from "@/features/marketing/attribution-client";
+import { marketingAttributionSnapshotSchema } from "@/features/marketing/types";
+import { appTokenRequestHeaders } from "@/lib/app-token-header";
 import type {
   DeploymentTargetPipelineAdapters,
   DeploymentTaskCreateInput,
@@ -59,18 +62,38 @@ function deployTaskErrorMessage(body: unknown): string {
 }
 
 export async function createDeploymentTaskFromApi({
+  appToken,
   encodedKubeconfig,
   input,
 }: {
+  appToken: string;
   encodedKubeconfig: string;
   input: DeploymentTaskCreateInput;
 }): Promise<DeploymentTaskCreateResult> {
+  // Attribution never blocks a deploy: stored state that no longer passes
+  // the server schema (oversized inbound params, stale shapes) is dropped
+  // instead of poisoning every create with a 400.
+  const storedAttribution = readMarketingAttribution();
+  const attributionParse =
+    storedAttribution == null
+      ? null
+      : marketingAttributionSnapshotSchema.safeParse(storedAttribution);
+  const marketingAttribution = attributionParse?.success
+    ? attributionParse.data
+    : undefined;
+  const requiresIdentityToken =
+    input.source.kind === "github" ||
+    marketingAttribution?.consent_token != null;
   const response = await fetch("/api/deploy-tasks", {
     body: JSON.stringify({
       ...input,
       encodedKubeconfig,
+      marketingAttribution,
     }),
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(requiresIdentityToken ? appTokenRequestHeaders(appToken) : {}),
+    },
     method: "POST",
   });
   const body = await response.json().catch(() => null);
@@ -84,14 +107,17 @@ export async function createDeploymentTaskFromApi({
 }
 
 export function createDeploymentTargetClientAdapters({
+  appToken,
   kubeconfig,
 }: {
+  appToken: string;
   kubeconfig: string;
   namespace: string;
 }): DeploymentTargetPipelineAdapters {
   return {
     createDeploymentTask: (input) =>
       createDeploymentTaskFromApi({
+        appToken,
         encodedKubeconfig: encodeURIComponent(kubeconfig),
         input,
       }),

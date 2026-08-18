@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getGithubConnectionStatusForWorkspaceActor } from "@/features/deploy/github/connection-service";
-import { CURRENT_GITHUB_OWNER_IDENTITY_VERSION } from "@/features/deploy/github/owner-identity";
+import { normalizeAssistantNamespace } from "@/features/chat/persistence/types";
+import {
+  adoptLegacyGithubConnectionForOwner,
+  getGithubConnectionStatusForOwner,
+} from "@/features/deploy/github/connection-service";
+import { verifiedGithubConnectionActor } from "@/features/deploy/github/owner-identity";
 import {
   deployTaskRequestParams,
   resolveDeployTaskRequestNamespace,
@@ -9,7 +13,7 @@ import {
 import { createDeployTaskAction } from "@/features/deploy/task/engine/actions";
 import { getDeployTaskEngineContext } from "@/features/deploy/task/engine/server";
 import {
-  resolveDeploymentTaskTarget,
+  resolveDeployTaskTargetForCreate,
   runDeployTask,
 } from "@/features/deploy/task/runner";
 import {
@@ -28,15 +32,24 @@ import {
   createDeployTaskInputSchema,
   deployTaskStatusSchema,
 } from "@/features/deploy/task/types";
+import { marketingAttributionSnapshotSchema } from "@/features/marketing/types";
+import { appTokenFromRequest } from "@/lib/app-token";
+import { IdentityBindingSupersededError } from "@/lib/identity-fingerprint-core";
+import { authorizeWorkspaceActor } from "@/lib/request-kubeconfig-auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const requestSchema = createDeployTaskInputSchema
-  .omit({ createdFrom: true })
+  .omit({ createdFrom: true, marketingAttribution: true })
   .partial({ runner: true, source: true, target: true })
   .extend({
     encodedKubeconfig: z.string().optional(),
+    /**
+     * Validated separately after parsing: a malformed attribution snapshot
+     * degrades to an unattributed deploy instead of rejecting the request.
+     */
+    marketingAttribution: z.unknown().optional(),
     /** Redeploy: clone this failed/cancelled predecessor (ADR 0038). */
     predecessorTaskId: z.string().trim().min(1).max(128).optional(),
   })
@@ -44,7 +57,9 @@ const requestSchema = createDeployTaskInputSchema
     (value) =>
       value.predecessorTaskId != null ||
       (value.runner != null && value.source != null && value.target != null),
-    { message: "source, target, and runner are required without a predecessor" }
+    {
+      message: "source, target, and runner are required without a predecessor",
+    }
   );
 
 function jsonError(message: string, status: number, code?: string) {
@@ -54,31 +69,83 @@ function jsonError(message: string, status: number, code?: string) {
   );
 }
 
+function identityBindingFailureResponse(error: unknown): NextResponse {
+  if (error instanceof IdentityBindingSupersededError) {
+    return jsonError(
+      "Authentication is required.",
+      401,
+      "app_token_superseded"
+    );
+  }
+  throw error;
+}
+
+/**
+ * Marketing attribution needs the same app-token identity binding as GitHub
+ * credentials. The regional workspace actor remains the deployment actor;
+ * the verified global uid is passed to the marketing normalizer separately.
+ */
 async function resolveCredentialBinding(input: {
-  creatingActor?: string;
+  appToken: string;
+  encodedKubeconfig?: string;
   namespace: string;
+  requiresMarketingIdentity: boolean;
   sourceKind?: DeploymentTaskSource["kind"];
 }): Promise<
-  | { credentialBinding?: DeploymentCredentialBinding }
+  | {
+      credentialBinding?: DeploymentCredentialBinding;
+      marketingConsentSubject?: string;
+    }
   | { response: NextResponse }
 > {
-  if (input.sourceKind !== "github") {
+  if (input.sourceKind !== "github" && !input.requiresMarketingIdentity) {
     return {};
   }
-  if (input.creatingActor == null) {
+  const authorization = await authorizeWorkspaceActor({
+    appToken: input.appToken,
+    encodedKubeconfig: input.encodedKubeconfig,
+    expectedNamespace: input.namespace,
+    normalizeNamespace: normalizeAssistantNamespace,
+  });
+  if (!authorization.ok) {
+    // Marketing identity is best-effort for namespace-shared sources: an
+    // unverifiable actor (missing or stale app token) degrades to an
+    // unattributed user — the normalizer scrubs unverified consent — instead
+    // of blocking the deploy. GitHub stays fail-closed: it needs the actor
+    // for credentials, not just attribution.
+    if (input.sourceKind !== "github") {
+      return {};
+    }
     return {
       response: jsonError(
-        "A verified Workspace Actor is required for GitHub deployment.",
-        403,
-        "workspace_actor_required"
+        authorization.message,
+        authorization.status,
+        authorization.code
       ),
     };
   }
-  const connection = await getGithubConnectionStatusForWorkspaceActor({
-    namespace: input.namespace,
-    ownerIdentityVersion: CURRENT_GITHUB_OWNER_IDENTITY_VERSION,
-    workspaceActor: input.creatingActor,
-  });
+  const marketingConsentSubject = authorization.actorBinding.userUid;
+  if (input.sourceKind !== "github") {
+    return { marketingConsentSubject };
+  }
+  const actor = verifiedGithubConnectionActor(authorization);
+  // Every verified entry request first adopts the initiator's legacy
+  // generation-1 crName row into the uid owner (lazy re-key, ADR-0059).
+  try {
+    await adoptLegacyGithubConnectionForOwner(actor);
+  } catch (error) {
+    if (error instanceof IdentityBindingSupersededError) {
+      return {
+        response: jsonError(
+          "Authentication is required.",
+          401,
+          "app_token_superseded"
+        ),
+      };
+    }
+    throw error;
+  }
+  const connection = await getGithubConnectionStatusForOwner(actor.owner);
   if (connection == null) {
     return {
       response: jsonError(
@@ -91,9 +158,10 @@ async function resolveCredentialBinding(input: {
   return {
     credentialBinding: {
       connectionRef: connection.id,
-      credentialOwner: input.creatingActor,
+      credentialOwner: actor.owner.userUid,
       version: CURRENT_DEPLOYMENT_CREDENTIAL_BINDING_VERSION,
     },
+    marketingConsentSubject,
   };
 }
 
@@ -185,52 +253,65 @@ export async function POST(request: Request) {
   }
   const effectiveSource = parsed.data.source ?? predecessor?.source;
   const creatingActor = namespaceResolved.workspaceActor;
+  // Attribution never blocks a deploy: a snapshot that fails validation is
+  // dropped here and the task proceeds unattributed.
+  const attributionParse =
+    parsed.data.marketingAttribution == null
+      ? null
+      : marketingAttributionSnapshotSchema.safeParse(
+          parsed.data.marketingAttribution
+        );
+  const marketingAttribution = attributionParse?.success
+    ? attributionParse.data
+    : undefined;
   const bindingResolution = await resolveCredentialBinding({
-    creatingActor,
+    appToken: appTokenFromRequest(request),
+    encodedKubeconfig: parsed.data.encodedKubeconfig,
     namespace: taskNamespace,
+    requiresMarketingIdentity: marketingAttribution?.consent_token != null,
     sourceKind: effectiveSource?.kind,
   });
   if ("response" in bindingResolution) {
     return bindingResolution.response;
   }
-  const { credentialBinding } = bindingResolution;
+  const { credentialBinding, marketingConsentSubject } = bindingResolution;
 
-  const { encodedKubeconfig, predecessorTaskId, ...taskInput } = parsed.data;
-  const result = await createDeployTaskAction(getDeployTaskEngineContext(), {
-    create: {
-      ...taskInput,
-      createdFrom: "ui",
-      ...(creatingActor == null ? {} : { creatingActor }),
-      ...(credentialBinding == null ? {} : { credentialBinding }),
-      namespace: taskNamespace,
-    },
+  const {
+    encodedKubeconfig,
+    marketingAttribution: _rawMarketingAttribution,
     predecessorTaskId,
-    resolveTarget: async (resolveInput) => {
-      const resolved = await resolveDeploymentTaskTarget({
-        id: "",
-        namespace: resolveInput.namespace,
-        projectId: null,
-        projectName: null,
-        target: resolveInput.target,
-      });
-      return {
-        projectId: resolved.projectId,
-        projectName: resolved.projectName,
-      };
-    },
-    run: (handle, task) =>
-      runDeployTask(handle, {
-        encodedKubeconfig,
-        // Full template args from the request body: the engine persists a
-        // stripped copy, so sensitive values reach the runner only through
-        // this in-memory hand-off (ADR 0037).
-        sourceArgValues:
-          parsed.data.source?.kind === "template"
-            ? parsed.data.source.args
-            : undefined,
-        taskId: task.id,
-      }),
-  });
+    ...taskInput
+  } = parsed.data;
+  let result: Awaited<ReturnType<typeof createDeployTaskAction>>;
+  try {
+    result = await createDeployTaskAction(getDeployTaskEngineContext(), {
+      create: {
+        ...taskInput,
+        createdFrom: "ui",
+        ...(creatingActor == null ? {} : { creatingActor }),
+        ...(credentialBinding == null ? {} : { credentialBinding }),
+        ...(marketingAttribution == null ? {} : { marketingAttribution }),
+        ...(marketingConsentSubject == null ? {} : { marketingConsentSubject }),
+        namespace: taskNamespace,
+      },
+      predecessorTaskId,
+      resolveTarget: resolveDeployTaskTargetForCreate,
+      run: (handle, task) =>
+        runDeployTask(handle, {
+          encodedKubeconfig,
+          // Full template args from the request body: the engine persists a
+          // stripped copy, so sensitive values reach the runner only through
+          // this in-memory hand-off (ADR 0037).
+          sourceArgValues:
+            parsed.data.source?.kind === "template"
+              ? parsed.data.source.args
+              : undefined,
+          taskId: task.id,
+        }),
+    });
+  } catch (error) {
+    return identityBindingFailureResponse(error);
+  }
 
   switch (result.kind) {
     case "created":
@@ -242,6 +323,14 @@ export async function POST(request: Request) {
       return jsonError(result.message, 400);
     case "predecessor-not-found":
       return jsonError("Deploy task predecessor not found", 404);
+    case "project-name-conflict":
+      // Only a caller-chosen name reaches here; derived names resolve their own
+      // collisions with a suffix (ADR 0058).
+      return jsonError(
+        `A project named "${result.displayName}" already exists.`,
+        409,
+        "project_name_conflict"
+      );
     case "predecessor-conflict":
       return NextResponse.json(
         {

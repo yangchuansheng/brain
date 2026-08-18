@@ -103,6 +103,88 @@ test("listTemplateCatalog maps Sealos provider templates to Brain choices", asyn
   ]);
 });
 
+test("listTemplateCatalog preserves safe parameter control metadata", async () => {
+  process.env.TEMPLATE_PROVIDER_URL = "https://template.example.com";
+  globalThis.fetch = (() =>
+    Promise.resolve(
+      jsonResponse({
+        code: 200,
+        data: {
+          templates: [
+            {
+              metadata: { name: "n8n" },
+              spec: {
+                inputs: {
+                  api_token: {
+                    default: "",
+                    description: "Private API token",
+                    options: ["private-default", "private-alternative"],
+                    required: true,
+                    type: "password",
+                  },
+                  timezone: {
+                    default: "UTC",
+                    description: "Workflow timezone",
+                    options: ["UTC", "Asia/Shanghai", 42],
+                    required: false,
+                    type: "choice",
+                  },
+                  use_postgresql: {
+                    default: false,
+                    description: "Use PostgreSQL",
+                    required: false,
+                    type: "boolean",
+                  },
+                  use_secret: {
+                    default: true,
+                    description: "Use secret integration",
+                    required: false,
+                    type: "boolean",
+                  },
+                },
+                title: "n8n",
+              },
+            },
+          ],
+        },
+      })
+    )) as unknown as typeof fetch;
+
+  const catalog = await listTemplateCatalog();
+
+  assert.deepEqual(catalog[0]?.args, [
+    {
+      default: "",
+      description: "Private API token",
+      key: "api_token",
+      required: true,
+      type: "password",
+    },
+    {
+      default: "UTC",
+      description: "Workflow timezone",
+      key: "timezone",
+      options: ["UTC", "Asia/Shanghai"],
+      required: false,
+      type: "choice",
+    },
+    {
+      default: "false",
+      description: "Use PostgreSQL",
+      key: "use_postgresql",
+      required: false,
+      type: "boolean",
+    },
+    {
+      default: "true",
+      description: "Use secret integration",
+      key: "use_secret",
+      required: false,
+      type: "boolean",
+    },
+  ]);
+});
+
 test("listTemplateCatalog maps localized legacy template fields", async () => {
   process.env.TEMPLATE_PROVIDER_URL = "https://template.example.com";
   globalThis.fetch = (() =>
@@ -239,6 +321,7 @@ test("getTemplateSource preserves already encoded kubeconfig authorization", asy
 
 test("deployTemplateInstance posts args and Brain labels to provider", async () => {
   process.env.TEMPLATE_PROVIDER_URL = "https://template.example.com/";
+  const controller = new AbortController();
   let requestedUrl = "";
   let requestedInit: RequestInit | undefined;
   globalThis.fetch = ((url, init) => {
@@ -276,6 +359,7 @@ test("deployTemplateInstance posts args and Brain labels to provider", async () 
       "brain.io/template-name": "n8n",
     },
     instanceName: "n8n-demo",
+    signal: controller.signal,
     templateName: "n8n",
   });
 
@@ -284,6 +368,7 @@ test("deployTemplateInstance posts args and Brain labels to provider", async () 
     "https://template.example.com/api/v2alpha/templates/instances"
   );
   assert.equal(requestedInit?.method, "POST");
+  assert.equal(requestedInit?.signal, controller.signal);
   assert.equal(
     (requestedInit?.headers as Record<string, string>).Authorization,
     "apiVersion%3A%20v1%0Aclusters%3A%0A-%20cluster%3A%0A%20%20%20%20server%3A%20https%3A%2F%2Fexample.com"

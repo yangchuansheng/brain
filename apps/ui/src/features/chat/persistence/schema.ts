@@ -1,6 +1,7 @@
 import type { UIMessage } from "ai";
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   index,
   integer,
@@ -27,7 +28,10 @@ export const assistantChats = ns.table(
     id: text("id").primaryKey(),
     /** Logical namespace bucket (UI: `namespaceAtom`); empty namespaces map to the default bucket at write time. */
     namespace: text("namespace").notNull(),
-    /** Verified `user-system` ServiceAccount name. Set at creation and immutable. */
+    /**
+     * The owner's global `userUid` (ADR-0059). Set at creation and immutable;
+     * legacy beta rows carry the per-region crName until lazily adopted.
+     */
     workspaceActor: text("workspace_actor").notNull(),
     /** Shown in thread picker; placeholders use `chat-YYYY-MM-DD` until renamed by AI after the first turn. */
     title: text("title").notNull().default("Chat"),
@@ -91,6 +95,44 @@ export const assistantEntitlements = ns.table(
   ]
 );
 
+/** Brain-owned lifecycle ledger for shared assistant Devbox runtimes. */
+export const assistantDevboxRuntimes = ns.table(
+  "assistant_devbox_runtimes",
+  {
+    upstreamId: text("upstream_id").primaryKey(),
+    namespace: text("namespace").notNull(),
+    runtimeName: text("runtime_name").notNull(),
+    pauseDueAt: timestamp("pause_due_at", {
+      mode: "date",
+      withTimezone: true,
+    }).notNull(),
+    pausedAt: timestamp("paused_at", { mode: "date", withTimezone: true }),
+    deleteDueAt: timestamp("delete_due_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+    cleanupLeaseOwner: text("cleanup_lease_owner"),
+    cleanupLeaseExpiresAt: timestamp("cleanup_lease_expires_at", {
+      mode: "date",
+      withTimezone: true,
+    }),
+    updatedAt: timestamp("updated_at", { mode: "date", withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    createdAt: timestamp("created_at", { mode: "date", withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("assistant_devbox_runtimes_pause_due_idx")
+      .on(table.pauseDueAt)
+      .where(sql`${table.pausedAt} IS NULL`),
+    index("assistant_devbox_runtimes_delete_due_idx")
+      .on(table.deleteDueAt)
+      .where(sql`${table.deleteDueAt} IS NOT NULL`),
+  ]
+);
+
 export const githubConnections = ns.table(
   "github_connections",
   {
@@ -122,6 +164,45 @@ export const githubConnections = ns.table(
     ),
     uniqueIndex("github_connections_namespace_unique_idx").on(table.namespace),
     index("github_connections_installation_idx").on(table.installationId),
+  ]
+);
+
+/**
+ * Region-local Identity Fingerprints (ADR-0059), owned by the authorization
+ * layer (`@/lib/identity-fingerprint`): the most recently observed
+ * `crName → userUid` binding and that token's minting time. An observation
+ * history, not an authoritative mapping — authority stays with desktop's
+ * token minting. A newer-minted contradiction re-keys the tombstone uid's
+ * personal resources to the surviving uid; an older-minted one marks a
+ * superseded token, refused at the authorization layer. Rows never appear in
+ * API responses; identifiers only in logs/telemetry.
+ */
+export const identityFingerprints = ns.table("identity_fingerprints", {
+  /** The per-region user CR name authenticated from the kubeconfig. */
+  crName: text("cr_name").primaryKey(),
+  /** The most recently observed global account uid bound to this crName. */
+  userUid: text("user_uid").notNull(),
+  /** That observation's app-token minting time (JWT `iat`, epoch seconds). */
+  mintedAt: bigint("minted_at", { mode: "number" }).notNull(),
+  observedAt: timestamp("observed_at", { mode: "date", withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  createdAt: timestamp("created_at", { mode: "date", withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});
+
+/** Durable redirects from merged account UIDs to their current survivor. */
+export const identityUidCanonicalizations = ns.table(
+  "identity_uid_canonicalizations",
+  {
+    userUid: text("user_uid").primaryKey(),
+    canonicalUserUid: text("canonical_user_uid").notNull(),
+  },
+  (table) => [
+    index("identity_uid_canonicalizations_canonical_idx").on(
+      table.canonicalUserUid
+    ),
   ]
 );
 
@@ -187,6 +268,9 @@ export const githubOauthConnections = ns.table(
 export type AssistantChatRow = typeof assistantChats.$inferSelect;
 export type AssistantChatMessageRow = typeof assistantChatMessages.$inferSelect;
 export type AssistantEntitlementRow = typeof assistantEntitlements.$inferSelect;
+export type AssistantDevboxRuntimeRow =
+  typeof assistantDevboxRuntimes.$inferSelect;
+export type IdentityFingerprintRow = typeof identityFingerprints.$inferSelect;
 export type GithubAppInstallSessionRow =
   typeof githubAppInstallSessions.$inferSelect;
 export type GithubConnectionRow = typeof githubConnections.$inferSelect;

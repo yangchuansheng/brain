@@ -16,6 +16,8 @@ export function nextFixtureId(prefix = "task"): string {
 }
 
 export interface TaskRowFixtureInput {
+  agentControlTokenHash?: DeployTaskRow["agentControlTokenHash"];
+  agentControlTokenRevokedAt?: DeployTaskRow["agentControlTokenRevokedAt"];
   artifactSummary?: DeployTaskRow["artifactSummary"];
   blockingInputs?: DeployTaskRow["blockingInputs"];
   cancelRequestedAt?: Date | null;
@@ -34,6 +36,7 @@ export interface TaskRowFixtureInput {
   retriedFromTaskId?: string | null;
   runner?: DeploymentTaskRunner;
   runtimeName?: string | null;
+  runtimePausedAt?: Date | null;
   runtimeProvider?: string | null;
   runtimeState?: string | null;
   source?: DeploymentTaskSource;
@@ -67,6 +70,7 @@ export async function insertTaskRow(
       retriedFromTaskId: null,
       runner: { kind: "template" },
       runtimeName: null,
+      runtimePausedAt: null,
       runtimeProvider: null,
       runtimeState: null,
       source: { kind: "template", templateName: "demo" },

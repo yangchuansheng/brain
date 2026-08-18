@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { marketingAttributionSnapshotSchema } from "@/features/marketing/types";
+
 import type {
   DeploymentCredentialBinding,
   DeploymentTaskCanvasProjection,
@@ -104,7 +106,7 @@ export const deploymentTaskSourceSchema = z.discriminatedUnion("kind", [
 export const deploymentTaskTargetSchema = z.discriminatedUnion("kind", [
   z.object({
     description: z.string().trim().max(256).optional(),
-    displayName: z.string().trim().min(1).max(256),
+    displayName: z.string().trim().min(1).max(256).optional(),
     kind: z.literal("newProject"),
   }),
   z.object({
@@ -130,6 +132,7 @@ export const deploymentTaskRunnerSchema = z.discriminatedUnion("kind", [
 
 export const createDeployTaskInputSchema = z.object({
   createdFrom: z.enum(["api", "automation", "chat", "ui"]).optional(),
+  marketingAttribution: marketingAttributionSnapshotSchema.optional(),
   namespace: z.string().trim().min(1),
   prompt: z.string().trim().max(4000).optional(),
   runner: deploymentTaskRunnerSchema,
@@ -137,11 +140,22 @@ export const createDeployTaskInputSchema = z.object({
   target: deploymentTaskTargetSchema,
 });
 
+/**
+ * Outcome of resolving a Deployment Task's Project at creation time. A caller
+ * that supplied its own Project Display Name learns its name was taken instead
+ * of having the Project silently renamed (ADR 0058).
+ */
+export type DeployTaskTargetResolution =
+  | { kind: "resolved"; projectId: string; projectName: string }
+  | { displayName: string; kind: "project-name-conflict" };
+
 export type CreateDeployTaskInput = z.infer<
   typeof createDeployTaskInputSchema
 > & {
   /** Server-resolved Workspace Actor; never accepted from the request body. */
   creatingActor?: string;
+  /** Server-resolved global user uid used to bind marketing consent. */
+  marketingConsentSubject?: string;
   /** Server-resolved immutable GitHub credential selection. */
   credentialBinding?: DeploymentCredentialBinding;
 };
@@ -225,7 +239,7 @@ export interface DeployTaskDTO {
   projectId: string | null;
   projectName: string | null;
   resultUrl: string | null;
-  /** Redeploy lineage (predecessor task id, purgeable; ADR 0038). */
+  /** Redeploy lineage (predecessor task id; ADR 0038). */
   retriedFromTaskId?: string | null;
   runner: DeploymentTaskRunner;
   runtimeName: string | null;

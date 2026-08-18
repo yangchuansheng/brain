@@ -90,6 +90,7 @@ export interface DeployTaskTransitionEvent {
 }
 
 export interface DeployTaskTransitionSet {
+  agentControlTokenRevokedAt?: Date | null;
   artifactSummary?: DeployTaskArtifactSummary;
   blockingInputs?: DeployTaskBlockingInput[];
   error?: string | null;
@@ -98,6 +99,12 @@ export interface DeployTaskTransitionSet {
 }
 
 export interface DeployTaskTransitionInput {
+  /**
+   * Optional atomic precedence guard for deadline resolution. A persisted
+   * cancel intent wins over timeout; a timeout transition that locked the row
+   * first prevents a later cancel request through the terminal status guard.
+   */
+  cancelRequest?: "absent" | "present";
   event?: DeployTaskTransitionEvent;
   /** Fence: reject unless the row still carries this lease epoch. */
   expectedLeaseEpoch?: number;
@@ -170,6 +177,13 @@ function transitionSets(
     sets.set("completed_at", sql`"completed_at" = now()`);
     sets.set("lease_owner", sql`"lease_owner" = NULL`);
     sets.set("lease_expires_at", sql`"lease_expires_at" = NULL`);
+    sets.set(
+      "agent_control_token_revoked_at",
+      sql`"agent_control_token_revoked_at" = CASE
+        WHEN "agent_control_token_hash" IS NULL THEN "agent_control_token_revoked_at"
+        ELSE COALESCE("agent_control_token_revoked_at", now())
+      END`
+    );
   } else {
     sets.set("completed_at", sql`"completed_at" = NULL`);
   }
@@ -196,6 +210,12 @@ function transitionSets(
   }
 
   const extra = input.set ?? {};
+  if ("agentControlTokenRevokedAt" in extra) {
+    sets.set(
+      "agent_control_token_revoked_at",
+      sql`"agent_control_token_revoked_at" = ${extra.agentControlTokenRevokedAt ?? null}`
+    );
+  }
   if (extra.phase != null) {
     sets.set("phase", sql`"phase" = ${extra.phase}`);
   }
@@ -247,6 +267,11 @@ export async function transitionDeployTask(
   ];
   if (input.expectedLeaseEpoch != null) {
     wheres.push(sql`"lease_epoch" = ${input.expectedLeaseEpoch}`);
+  }
+  if (input.cancelRequest === "absent") {
+    wheres.push(sql`"cancel_requested_at" IS NULL`);
+  } else if (input.cancelRequest === "present") {
+    wheres.push(sql`"cancel_requested_at" IS NOT NULL`);
   }
 
   const update = sql`UPDATE ${TASKS}

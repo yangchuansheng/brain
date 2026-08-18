@@ -24,15 +24,27 @@ export function getDevboxBaseUrlFromEnv(env: DevboxEnv): string {
   return normalizeBaseUrl(getRequiredEnv(env, "DEVBOX_API_BASE_URL"));
 }
 
+/**
+ * Whether this deployment can talk to a Devbox API at all.
+ *
+ * Mirrors what {@link getDevboxBaseUrlFromEnv} and
+ * {@link getDevboxAuthTokenFromEnv} require, so background callers can skip
+ * quietly instead of throwing on every invocation. On-demand callers (bash
+ * tools) should still let the throw surface as a real tool error.
+ */
+export function isDevboxConfiguredFromEnv(env: DevboxEnv): boolean {
+  const hasBaseUrl = (env.DEVBOX_API_BASE_URL?.trim() ?? "") !== "";
+  const hasAuth =
+    (env.DEVBOX_TOKEN?.trim() ?? "") !== "" ||
+    (env.DEVBOX_JWT_SIGNING_KEY?.trim() ?? "") !== "";
+  return hasBaseUrl && hasAuth;
+}
+
 export function getDevboxDefaultImageFromEnv(
   env: DevboxEnv
 ): string | undefined {
   const image = env.DEVBOX_RUNTIME_IMAGE?.trim();
   return image === "" ? undefined : image;
-}
-
-export function getDevboxArchiveAfterPauseTimeFromEnv(env: DevboxEnv): string {
-  return env.DEVBOX_ARCHIVE_AFTER_PAUSE_TIME?.trim() || "24h";
 }
 
 export function validateDevboxAuthNamespace(namespace: string): string {

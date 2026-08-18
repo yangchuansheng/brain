@@ -38,6 +38,7 @@ const COMBOBOX_ROLE_RE = /role="combobox"/;
 const MYSQL_RE = /MySQL/;
 const SELECTED_COUNT_RE = /2 selected/;
 const SINGLE_ARIA_RE = /aria-label="Database engine"/;
+const SINGLE_DESCRIPTION_RE = /aria-describedby="database-engine-description"/;
 const MULTI_ARIA_RE = /aria-label="Log containers"/;
 const SINGLE_EMPTY_SLOT_RE = /data-slot="app-select-empty"/;
 const MULTI_EMPTY_SLOT_RE = /data-slot="app-multi-select-empty"/;
@@ -46,13 +47,19 @@ const NO_CONTAINERS_RE = /No containers/;
 const NON_SEARCHABLE_FILTER_RE =
   /const filter = searchable \? undefined : null;/g;
 const COMBOBOX_FILTER_PROP_RE = /filter=\{filter\}/g;
+const APP_SELECT_POPUP_Z_INDEX_RE = /className="isolate z-\[(\d+)\]"/;
+const DIALOG_Z_INDEX_RE = /z-\[(\d+)\] grid w-full/;
 const SOURCE = readFileSync(
   fileURLToPath(new URL("./app-select.tsx", import.meta.url))
+).toString();
+const DIALOG_SOURCE = readFileSync(
+  fileURLToPath(new URL("./dialog.tsx", import.meta.url))
 ).toString();
 
 test("AppSelect renders the selected option in the trigger", () => {
   const html = renderToStaticMarkup(
     <AppSelect
+      aria-describedby="database-engine-description"
       aria-label="Database engine"
       onValueChange={() => undefined}
       options={SINGLE_OPTIONS}
@@ -61,6 +68,7 @@ test("AppSelect renders the selected option in the trigger", () => {
   );
 
   assert.match(html, SINGLE_ARIA_RE);
+  assert.match(html, SINGLE_DESCRIPTION_RE);
   assert.match(html, MYSQL_RE);
   assert.match(html, COMBOBOX_ROLE_RE);
 });
@@ -110,5 +118,17 @@ test("AppSelect disables combobox filtering when search is hidden", () => {
     [...SOURCE.matchAll(COMBOBOX_FILTER_PROP_RE)].length,
     2,
     "single and multi select should pass the resolved filter to Base UI"
+  );
+});
+
+test("AppSelect popup renders above dialog content", () => {
+  const popupZIndex = SOURCE.match(APP_SELECT_POPUP_Z_INDEX_RE)?.[1];
+  const dialogZIndex = DIALOG_SOURCE.match(DIALOG_Z_INDEX_RE)?.[1];
+
+  assert.ok(popupZIndex, "AppSelect popup should define an explicit z-index");
+  assert.ok(dialogZIndex, "Dialog content should define an explicit z-index");
+  assert.ok(
+    Number(popupZIndex) > Number(dialogZIndex),
+    "AppSelect popup should stack above dialog content"
   );
 });

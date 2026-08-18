@@ -18,6 +18,7 @@ import {
   ResourceSettingsSection,
 } from "@workspace/ui/components/resource-settings/resource-settings";
 import { SettingsSlider } from "@workspace/ui/components/settings-slider/settings-slider";
+import { SidePaneFooter } from "@workspace/ui/components/side-pane";
 import { Switch } from "@workspace/ui/components/switch";
 import {
   Cpu,
@@ -254,7 +255,9 @@ function shouldShowConnectionAddress(connection: DatabaseNodeConnection) {
 }
 
 type DatabaseSettingsConnectionCopyHandler = (
-  connection: DatabaseNodeConnection
+  connection: DatabaseNodeConnection,
+  /** The row's on-screen value while its reveal is active — copied verbatim, no fetch (ADR-0055). */
+  activeRevealValue?: string
 ) => Promise<void>;
 
 type DatabaseSettingsConnectionRevealHandler = (
@@ -289,7 +292,7 @@ function DatabaseSettingsConnectionAddressRow({
     <DatabaseConnectionRow
       connection={connection}
       label={displayConnectionLabel(connection)}
-      onCopy={() => onCopyConnection(connection)}
+      onCopy={() => onCopyConnection(connection, revealedValue)}
       onToggleReveal={
         revealAvailable
           ? () => onRevealConnection(connection, rowKey)
@@ -426,7 +429,7 @@ function DatabaseSettingsFooter({
     <ResourceSettingsDraftFooter
       cancelAriaLabel="Discard database configuration changes"
       canSubmit={canUpdate}
-      className="p-2.5"
+      className="w-full"
       conflictMessage={conflictMessage}
       dirty={dirty}
       onCancel={onCancel}
@@ -513,8 +516,9 @@ export function useDatabaseSettingsSections({
     [resolveConnectionString, toggleRevealedRow, workload]
   );
   const copyConnection = useCallback<DatabaseSettingsConnectionCopyHandler>(
-    (connection) =>
+    (connection, activeRevealValue) =>
       copyDbConnectionValue({
+        activeRevealValue,
         placeholderValue: connection.value ?? "",
         resolveAvailable: revealAvailable,
         resolveValue: () => resolveConnectionString(workload, connection.kind),
@@ -1108,7 +1112,9 @@ export function DatabaseSettingsPaneContent({
           </ResourceSettingsSection>
         )
       )}
-      {model.footer}
+      {model.footer == null ? null : (
+        <SidePaneFooter>{model.footer}</SidePaneFooter>
+      )}
     </>
   );
 

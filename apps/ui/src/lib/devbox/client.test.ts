@@ -18,7 +18,7 @@ afterAll(() => {
   process.env.DEVBOX_TOKEN = originalToken;
 });
 
-const { execDevbox } = await import("./client");
+const { deleteDevbox, execDevbox, pauseDevbox } = await import("./client");
 
 test("exec Devbox fetch is cancelled by the caller abort signal", async () => {
   let fetchSignal: AbortSignal | null | undefined;
@@ -64,5 +64,31 @@ test("an abort during Devbox network retry delay prevents another fetch", async 
       error instanceof DOMException && error.name === "AbortError"
   );
 
+  assert.equal(fetchCalls, 1);
+});
+
+test("pause Devbox fetch is cancelled by the caller abort signal", async () => {
+  let fetchSignal: AbortSignal | null | undefined;
+  globalThis.fetch = ((_input, init) => {
+    fetchSignal = init?.signal;
+    return Promise.resolve(Response.json({ data: {} }));
+  }) as typeof fetch;
+  const controller = new AbortController();
+
+  await pauseDevbox("ns-test", "runtime", controller.signal);
+
+  assert.equal(fetchSignal?.aborted, false);
+  controller.abort();
+  assert.equal(fetchSignal?.aborted, true);
+});
+
+test("delete Devbox leaves network retry to the lifecycle reaper", async () => {
+  let fetchCalls = 0;
+  globalThis.fetch = (() => {
+    fetchCalls += 1;
+    return Promise.reject(new TypeError("fetch failed"));
+  }) as unknown as typeof fetch;
+
+  await assert.rejects(deleteDevbox("ns-test", "runtime"));
   assert.equal(fetchCalls, 1);
 });
